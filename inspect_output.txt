@@ -1,0 +1,10 @@
+=== 标准底稿 Sheets ===
+['汇总 ', 'K.00 Lead Sheet', 'K.01 Agree SL to GL', 'FA list', 'K.02.1 新增测试 ', 'K.02.1a 新增选样输出', '新增清单', 'K.02.2 处置测试', 'K.02.2a 处置选样输出', 'SkywindSettingSheet', '处置清单', 'K.03.1 SAP', 'K.03.2 折旧测试TOD', 'K.03.3 折旧政策复核']
+
+=== 标准底稿 K.00 Lead Sheet 前5行 ===
+(1,2):                                                                                 
+(2,2): 客户名称
+Traceback (most recent call last):
+  File "F:\AI专用\AI工作区\底稿roll forward\inspect_excel.py", line 19, in <module>
+    print(v)
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2022' in position 57: illegal multibyte sequence

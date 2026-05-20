@@ -1,0 +1,8 @@
+=== K.00 Lead Sheet 完整结构 ===
+  (1,2):                                                                                                     
+  (2,2): 客户名称
+  (2,3): 六六六有限公司
+Traceback (most recent call last):
+  File "F:\AI专用\AI工作区\底稿roll forward\inspect_k00_full.py", line 13, in <module>
+    print(f"  ({row},{col}): {str(val)[:100]}")
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2022' in position 59: illegal multibyte sequence

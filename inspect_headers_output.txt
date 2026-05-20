@@ -1,0 +1,8 @@
+=== K.00 Lead Sheet 表头 ===
+  (1,2):                                                                                                                              标准工作底稿: K1 SWP 不动产、厂房和设备及相关账户（PPE）
+  (2,2): 客户名称
+  (2,3): 六六六有限公司
+Traceback (most recent call last):
+  File "F:\AI专用\AI工作区\底稿roll forward\inspect_headers.py", line 13, in <module>
+    print(f"  ({row},{col}): {val}")
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2022' in position 59: illegal multibyte sequence
