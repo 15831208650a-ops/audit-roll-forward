@@ -14,6 +14,7 @@ PyInstaller.__main__.run([
     '--name=AuditRollForward',
     '--onefile',
     '--windowed',
+    '--noconfirm',
     '--icon=NONE',
     '--add-data=subjects_config.json;.',  # Windows下用分号，Linux/Mac下用冒号
     '--add-data=templates;templates',

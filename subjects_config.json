@@ -26,13 +26,28 @@
         "sheet_name": "J.00  Lead Sheet",
         "header_search_text": "期末审定数",
         "closing_col": 9,
-        "opening_col": 10
+        "opening_col": 10,
+        "clear_current_period_cols": [5, 6, 7, 8, 9]
       },
       "k01": {
         "has_k01": true,
         "sheet_name": "J.01 Agree SL to GL",
         "header_row": 11,
         "opening_balance_rows": [13],
+        "roll_forward_groups": [
+          {
+            "group": "在建工程-账面余额",
+            "source_detail": "期末余额",
+            "target_detail": "期初余额",
+            "value_cols": [5, 7, 9]
+          },
+          {
+            "group": "在建工程-减值准备",
+            "source_detail": "期末余额",
+            "target_detail": "期初余额",
+            "value_cols": [5, 7, 9]
+          }
+        ],
         "categories": [
           {"name": "在建工程-账面余额", "audit_col": 11, "book_col": 5}
         ]
@@ -67,6 +82,11 @@
       "name": "无形资产",
       "template_file": "L1 SWP 无形资产 202YMMDD XYZ公司.xlsx",
       "prior_file_pattern": "L1*无形资产*{prior_year}*.xlsx",
+      "prior_file_patterns": [
+        "LAR*无形资产*{prior_year}*.xlsx",
+        "LRA*无形资产*.xlsx",
+        "L1*无形资产*{prior_year}*.xlsx"
+      ],
       "lead_sheet": {
         "sheet_name": "L1.00 Lead sheet",
         "header_search_text": "期末审定数",

@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QFont, QColor, QPalette, QLinearGradient, QBrush, QPainter, QPaintEvent
 
-from roll_forward_core import process_multiple_subjects, SubjectConfig
+from roll_forward_core import process_multiple_subjects, resource_path, SubjectConfig
 
 
 class CyberpunkApp(QMainWindow):
@@ -245,6 +245,16 @@ class CyberpunkApp(QMainWindow):
         params_layout.addWidget(self.create_label("资产负债表日期"), 0, 2)
         self.date_input = self.create_cyber_input("格式: 2026/12/31")
         params_layout.addWidget(self.date_input, 0, 3)
+
+        # 记账本位币
+        params_layout.addWidget(self.create_label("记账本位币"), 1, 0)
+        self.functional_currency_input = self.create_cyber_input("如：人民币")
+        params_layout.addWidget(self.functional_currency_input, 1, 1)
+
+        # 适用会计准则
+        params_layout.addWidget(self.create_label("适用会计准则"), 1, 2)
+        self.accounting_standard_input = self.create_cyber_input("如：企业会计准则")
+        params_layout.addWidget(self.accounting_standard_input, 1, 3)
 
         params_card.layout().addLayout(params_layout)
         layout.addWidget(params_card)
@@ -602,13 +612,15 @@ class CyberpunkApp(QMainWindow):
         pmte_path = self.pmte_input.text().strip()
         company_name = self.company_input.text().strip()
         bs_date = self.date_input.text().strip()
+        functional_currency = self.functional_currency_input.text().strip()
+        accounting_standard = self.accounting_standard_input.text().strip()
         output_dir = self.output_dir_input.text().strip()
 
         if not all([prior_dir, pmte_path, company_name, bs_date, output_dir]):
             QMessageBox.warning(self, "警告", "请填写所有必填项！")
             return
 
-        template_dir = os.path.join(os.path.dirname(__file__), "templates")
+        template_dir = resource_path("templates")
         if not os.path.exists(template_dir):
             QMessageBox.warning(self, "警告", f"找不到模板目录: {template_dir}")
             return
@@ -623,12 +635,17 @@ class CyberpunkApp(QMainWindow):
         self.log_output.append(">>> 系统初始化完成")
         self.log_output.append(f">>> 目标公司: {company_name}")
         self.log_output.append(f">>> 资产负债表日: {bs_date}")
+        if functional_currency:
+            self.log_output.append(f">>> 记账本位币: {functional_currency}")
+        if accounting_standard:
+            self.log_output.append(f">>> 适用会计准则: {accounting_standard}")
         self.log_output.append(f">>> 待处理科目数: {len(subject_codes)}")
         self.log_output.append(">>> " + "=" * 50)
 
         self.worker = RollForwardWorker(
             subject_codes, template_dir, prior_dir, pmte_path,
-            company_name, bs_date, output_dir
+            company_name, bs_date, output_dir,
+            functional_currency, accounting_standard
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.processing_finished)
@@ -644,7 +661,7 @@ class CyberpunkApp(QMainWindow):
         self.start_btn.setEnabled(True)
         self.start_btn.setText("▶  开始处理")
 
-        success_count = sum(1 for _, success, _, _ in results if success)
+        success_count = sum(1 for result in results if len(result) > 1 and result[1])
         total_count = len(results)
 
         self.log_output.append(">>> " + "=" * 50)
@@ -663,7 +680,8 @@ class RollForwardWorker(QThread):
     finished_signal = pyqtSignal(list)
 
     def __init__(self, subject_codes, template_dir, prior_dir, pmte_path,
-                 company_name, bs_date, output_dir):
+                 company_name, bs_date, output_dir,
+                 functional_currency=None, accounting_standard=None):
         super().__init__()
         self.subject_codes = subject_codes
         self.template_dir = template_dir
@@ -672,12 +690,16 @@ class RollForwardWorker(QThread):
         self.company_name = company_name
         self.bs_date = bs_date
         self.output_dir = output_dir
+        self.functional_currency = functional_currency
+        self.accounting_standard = accounting_standard
 
     def run(self):
         try:
             results = process_multiple_subjects(
                 self.subject_codes, self.template_dir, self.prior_dir,
-                self.pmte_path, self.company_name, self.bs_date, self.output_dir
+                self.pmte_path, self.company_name, self.bs_date, self.output_dir,
+                functional_currency=self.functional_currency,
+                accounting_standard=self.accounting_standard
             )
 
             for i, (subject_code, success, message, output_path, warnings_list) in enumerate(results):
