@@ -20,10 +20,10 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.cell.cell import MergedCell
-from openpyxl.styles import Border, PatternFill
+from openpyxl.styles import Alignment, Border, PatternFill, Side
 from openpyxl.formula.translate import Translator
 from openpyxl.formatting.formatting import ConditionalFormatting
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 
 # 忽略openpyxl的警告
@@ -116,6 +116,24 @@ def find_prior_file(prior_dir, subject_code, prior_year, config):
         for filename in candidates:
             if subject_code in filename:
                 return os.path.join(search_dir, filename)
+
+        subject_aliases = {
+            "L1": ["LAR", "LRA", "无形资产"],
+            "Uexp": ["U_exp", "财务费用"],
+            "UexpVCVD": ["U_exp", "VC&VD", "销售费用", "管理费用"],
+        }
+        aliases = subject_aliases.get(subject_code, [])
+        for alias in aliases:
+            matched = [
+                filename for filename in candidates
+                if alias in filename and (str(prior_year) in filename or subject_code == "L1")
+            ]
+            if matched:
+                matched.sort(
+                    key=lambda filename: os.path.getmtime(os.path.join(search_dir, filename)),
+                    reverse=True
+                )
+                return os.path.join(search_dir, matched[0])
 
         # 3. 尝试用pattern中的关键字匹配（科目代码可能和文件名不完全一致）
         for pattern in patterns:
@@ -246,6 +264,15 @@ def row_contains_any(ws, row, keywords, columns=None):
     row_text = " ".join(str(ws.cell(row=row, column=col).value or "") for col in columns)
     normalized = normalize_text(row_text)
     return any(normalize_text(keyword) in normalized for keyword in keywords)
+
+
+def is_table_end_marker_row(ws, row, max_col=3):
+    """Return True for worksheet marker rows such as /T1."""
+    for col in range(1, min(max_col, ws.max_column) + 1):
+        value = ws.cell(row=row, column=col).value
+        if isinstance(value, str) and normalize_text(value).upper().startswith("/T"):
+            return True
+    return False
 
 
 def copy_cell_shape(source_cell, target_cell, translate_formula=False):
@@ -538,6 +565,811 @@ def highlight_rows(ws, rows, col_start=1, col_end=None):
                 cell.fill = copy(fill)
 
 
+WORDING_START_KEYWORDS = (
+    "预期",
+    "波动说明",
+    "波动分析",
+    "Notes",
+    "Notes:",
+    "Notes：",
+    "调整汇总",
+    "调整分录",
+    "调整事项",
+    "ARP",
+    "变动不在范围",
+    "在下文中描述",
+    "对于单项变动金额",
+)
+
+WORDING_END_ROW_KEYWORDS = (
+    "账套名称",
+    "账套编码",
+    "总账科目编码",
+    "科目名称",
+    "期末账面数",
+    "期末审定数",
+    "本期期末审定数",
+    "公司名称",
+    "银行/存款机构",
+    "账号",
+    "项目编码",
+    "债务描述",
+    "资产类别",
+)
+
+WORDING_HIGHLIGHT_FILL = PatternFill(fill_type="solid", fgColor="FFFF99")
+SUMMARY_SHEET_NAME = "Roll Forward Summary"
+SUMMARY_DETAIL_LIMIT = 1000
+
+
+class RollForwardWarnings(list):
+    """Warnings list with optional run metadata for the GUI."""
+
+    def __init__(self):
+        super().__init__()
+        self.metadata = {}
+
+
+def cell_fill_key(cell):
+    """Return a compact fill key used for lightweight diff reporting."""
+    fill = cell.fill
+    if not fill or not fill.fill_type:
+        return None
+
+    color = fill.fgColor
+    if color is None:
+        return None
+    if color.type == "rgb":
+        return color.rgb
+    if color.type == "indexed":
+        return f"indexed:{color.indexed}"
+    if color.type == "theme":
+        return f"theme:{color.theme}:{color.tint}"
+    return str(color.rgb or color.indexed or color.theme or "")
+
+
+def is_yellow_fill(fill_key):
+    """Return True for the yellow review marker used by wording roll-forward."""
+    if not fill_key:
+        return False
+    return str(fill_key).upper().endswith("FFFF99")
+
+
+def workbook_snapshot(wb):
+    """Take a value/fill snapshot without changing workbook contents."""
+    snapshot = {}
+    for ws in wb.worksheets:
+        if ws.title == SUMMARY_SHEET_NAME:
+            continue
+        sheet_cells = {}
+        for key, cell in ws._cells.items():
+            sheet_cells[key] = (cell.value, cell_fill_key(cell))
+        snapshot[ws.title] = sheet_cells
+    return snapshot
+
+
+def short_cell_value(value, limit=160):
+    """Format a cell value for the summary sheet."""
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) > limit:
+        return text[:limit - 3] + "..."
+    return text
+
+
+def build_workbook_diff(before_snapshot, wb):
+    """Compare the initial template snapshot with the processed workbook."""
+    after_snapshot = workbook_snapshot(wb)
+    updated_cells = []
+    yellow_cells = []
+    updated_sheets = set()
+
+    sheet_names = sorted(set(before_snapshot) | set(after_snapshot))
+    for sheet_name in sheet_names:
+        before_cells = before_snapshot.get(sheet_name, {})
+        after_cells = after_snapshot.get(sheet_name, {})
+        cell_keys = set(before_cells) | set(after_cells)
+
+        for row, col in sorted(cell_keys):
+            before_value, before_fill = before_cells.get((row, col), (None, None))
+            after_value, after_fill = after_cells.get((row, col), (None, None))
+            address = f"{get_column_letter(col)}{row}"
+
+            if before_value != after_value:
+                updated_sheets.add(sheet_name)
+                updated_cells.append({
+                    "sheet": sheet_name,
+                    "cell": address,
+                    "before": before_value,
+                    "after": after_value,
+                })
+
+            if is_yellow_fill(after_fill) and before_fill != after_fill:
+                yellow_cells.append({
+                    "sheet": sheet_name,
+                    "cell": address,
+                    "value": after_value,
+                })
+
+    return {
+        "updated_sheets": sorted(updated_sheets),
+        "updated_cells": updated_cells,
+        "yellow_cells": yellow_cells,
+    }
+
+
+def write_rows(ws, start_row, headers, rows, limit=SUMMARY_DETAIL_LIMIT):
+    """Write a bounded table and return the next available row."""
+    row = start_row
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=col, value=header)
+        cell.fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    row += 1
+
+    shown_rows = rows[:limit]
+    for item in shown_rows:
+        for col, value in enumerate(item, 1):
+            ws.cell(row=row, column=col, value=value)
+        row += 1
+
+    if len(rows) > limit:
+        ws.cell(row=row, column=1, value=f"... truncated, {len(rows) - limit} more rows")
+        row += 1
+
+    return row + 1
+
+
+def add_roll_forward_summary_sheet(wb, subject_code, subject_name, company_name, bs_date,
+                                   prior_path, output_path, warnings_list, options,
+                                   wording_count, wording_sheets, before_snapshot):
+    """Append a lightweight run summary sheet to the generated workbook."""
+    diff = build_workbook_diff(before_snapshot, wb)
+
+    if SUMMARY_SHEET_NAME in wb.sheetnames:
+        del wb[SUMMARY_SHEET_NAME]
+    ws = wb.create_sheet(SUMMARY_SHEET_NAME)
+
+    warning_items = list(dict.fromkeys(warnings_list))
+    unmatched_items = list(warning_items)
+    if options.get("roll_wording") and wording_count == 0:
+        unmatched_items.append("未匹配到可复制的 wording 区域，或上年底稿无可复制 wording 内容")
+
+    metadata = {
+        "updated_sheet_count": len(diff["updated_sheets"]),
+        "updated_cell_count": len(diff["updated_cells"]),
+        "yellow_cell_count": len(diff["yellow_cells"]),
+        "wording_copied_count": wording_count,
+        "wording_sheets": wording_sheets,
+        "warnings_count": len(warning_items),
+        "unmatched_count": len(unmatched_items),
+        "summary_sheet": SUMMARY_SHEET_NAME,
+    }
+    if hasattr(warnings_list, "metadata"):
+        warnings_list.metadata.update(metadata)
+
+    ws.cell(row=1, column=1, value="Roll Forward Summary")
+    ws.cell(row=2, column=1, value="Generated at")
+    ws.cell(row=2, column=2, value=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    ws.cell(row=3, column=1, value="Subject")
+    ws.cell(row=3, column=2, value=f"{subject_code} {subject_name}".strip())
+    ws.cell(row=4, column=1, value="Company")
+    ws.cell(row=4, column=2, value=company_name)
+    ws.cell(row=5, column=1, value="Balance sheet date")
+    ws.cell(row=5, column=2, value=bs_date)
+    ws.cell(row=6, column=1, value="Prior file")
+    ws.cell(row=6, column=2, value=prior_path)
+    ws.cell(row=7, column=1, value="Output file")
+    ws.cell(row=7, column=2, value=output_path)
+
+    option_text = []
+    option_text.append(f"roll wording: {'Yes' if options.get('roll_wording') else 'No'}")
+    option_text.append(f"generate summary: {'Yes' if options.get('generate_summary') else 'No'}")
+    ws.cell(row=8, column=1, value="Options")
+    ws.cell(row=8, column=2, value="; ".join(option_text))
+
+    rows = [
+        ("Updated sheets", metadata["updated_sheet_count"]),
+        ("Updated cells", metadata["updated_cell_count"]),
+        ("Yellow cells", metadata["yellow_cell_count"]),
+        ("Wording copied cells", wording_count),
+        ("Warnings / unmatched", metadata["unmatched_count"]),
+    ]
+    write_rows(ws, 10, ["Metric", "Count"], rows)
+
+    row = 18
+    row = write_rows(
+        ws,
+        row,
+        ["Updated sheet"],
+        [(sheet_name,) for sheet_name in diff["updated_sheets"]],
+    )
+    row = write_rows(
+        ws,
+        row,
+        ["Sheet", "Cell", "Before", "After"],
+        [
+            (
+                item["sheet"],
+                item["cell"],
+                short_cell_value(item["before"]),
+                short_cell_value(item["after"]),
+            )
+            for item in diff["updated_cells"]
+        ],
+    )
+    row = write_rows(
+        ws,
+        row,
+        ["Sheet", "Yellow cell", "Value"],
+        [
+            (item["sheet"], item["cell"], short_cell_value(item["value"]))
+            for item in diff["yellow_cells"]
+        ],
+    )
+    write_rows(
+        ws,
+        row,
+        ["Warnings / unmatched areas"],
+        [(item,) for item in unmatched_items],
+    )
+
+    for col, width in {"A": 28, "B": 32, "C": 44, "D": 44}.items():
+        ws.column_dimensions[col].width = width
+    for row_cells in ws.iter_rows():
+        for cell in row_cells:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A10"
+
+    return metadata
+
+
+def get_row_text(ws, row, col_start=1, col_end=None):
+    """Return a compact text representation of a worksheet row."""
+    col_end = col_end or min(ws.max_column, 40)
+    values = []
+    for col in range(col_start, min(col_end, ws.max_column) + 1):
+        value = ws.cell(row=row, column=col).value
+        if value not in (None, ""):
+            values.append(str(value))
+    return " ".join(values)
+
+
+def text_has_any_keyword(text, keywords):
+    """Case-insensitive keyword match with whitespace normalized."""
+    text_key = normalize_text(text).lower()
+    return any(normalize_text(keyword).lower() in text_key for keyword in keywords)
+
+
+def row_has_any_keyword(ws, row, keywords, col_start=1, col_end=None):
+    """Return True when a row contains any keyword."""
+    return text_has_any_keyword(get_row_text(ws, row, col_start, col_end), keywords)
+
+
+def find_wording_start_rows(ws):
+    """Find likely wording/commentary section anchors."""
+    starts = []
+    last_start = 0
+    for row in range(1, ws.max_row + 1):
+        if row <= last_start + 1:
+            continue
+        if row_has_any_keyword(ws, row, WORDING_END_ROW_KEYWORDS):
+            continue
+        if row_has_any_keyword(ws, row, WORDING_START_KEYWORDS):
+            starts.append(row)
+            last_start = row
+    return starts
+
+
+def find_wording_section_end(ws, start_row, next_start_row=None, max_rows=80):
+    """Find the end of a wording section using the next anchor and blank runs."""
+    hard_end = min(ws.max_row, start_row + max_rows - 1)
+    if next_start_row:
+        hard_end = min(hard_end, next_start_row - 1)
+
+    last_content_row = start_row
+    blank_run = 0
+    for row in range(start_row, hard_end + 1):
+        if row > start_row and is_table_end_marker_row(ws, row):
+            return max(start_row, row - 1)
+        if row > start_row and row_has_any_keyword(ws, row, WORDING_END_ROW_KEYWORDS):
+            return max(start_row, row - 1)
+
+        has_content = row_has_content(ws, row, 1, min(ws.max_column, 40))
+        if has_content:
+            last_content_row = row
+            blank_run = 0
+        else:
+            blank_run += 1
+            if row > start_row and blank_run >= 3:
+                return last_content_row
+
+    return last_content_row
+
+
+def get_matching_wording_keywords(ws, row):
+    """Return the wording keywords present in an anchor row."""
+    text = get_row_text(ws, row)
+    text_key = normalize_text(text).lower()
+    return [
+        keyword
+        for keyword in WORDING_START_KEYWORDS
+        if normalize_text(keyword).lower() in text_key
+    ]
+
+
+def find_target_wording_start(ws_target, source_anchor_row, source_keywords):
+    """Find the corresponding wording anchor in the target worksheet."""
+    if not source_keywords:
+        source_keywords = WORDING_START_KEYWORDS
+
+    target_starts = find_wording_start_rows(ws_target)
+    windows = [
+        (max(1, source_anchor_row - 25), min(ws_target.max_row, source_anchor_row + 25)),
+        (1, ws_target.max_row),
+    ]
+    for start, end in windows:
+        for row in target_starts:
+            if row < start or row > end:
+                continue
+            if row_has_any_keyword(ws_target, row, source_keywords):
+                return row
+
+    if source_anchor_row <= ws_target.max_row:
+        return source_anchor_row
+    return ws_target.max_row
+
+
+def is_adjustment_wording_section(ws, start_row):
+    """Return True for adjustment summary style sections where numbers matter too."""
+    return row_has_any_keyword(
+        ws,
+        start_row,
+        ("调整汇总", "调整分录", "调整事项"),
+    )
+
+
+def source_wording_value(formula_cell, value_cell, table_like=False):
+    """Return the value to roll for a wording cell, or None when it should be skipped."""
+    formula_value = formula_cell.value
+    value = value_cell.value
+
+    if formula_value in (None, "") and value in (None, ""):
+        return None
+
+    if isinstance(formula_value, str) and formula_value.startswith("="):
+        return value if table_like and value not in (None, "") else None
+
+    if isinstance(formula_value, str):
+        return formula_value
+
+    if table_like and value not in (None, ""):
+        return value
+
+    return None
+
+
+def highlight_wording_cell(ws, row, col):
+    """Highlight one copied wording cell."""
+    cell = ws.cell(row=row, column=col)
+    if not isinstance(cell, MergedCell):
+        cell.fill = copy(WORDING_HIGHLIGHT_FILL)
+        try:
+            cell.font = cell.font.copy(color="000000")
+        except Exception:
+            pass
+
+
+def ensure_target_wording_capacity(ws_target, target_start, target_len, required_len):
+    """Insert rows when the target wording area is shorter than the source section."""
+    extra_rows = required_len - target_len
+    if extra_rows <= 0:
+        return
+
+    insert_at = target_start + max(target_len, 1)
+    source_shape_row = max(target_start, insert_at - 1)
+    insert_rows_preserving_sheet_metadata(ws_target, insert_at, extra_rows)
+    for offset in range(extra_rows):
+        copy_row_shape(ws_target, source_shape_row, insert_at + offset, translate_formula=True)
+
+
+def copy_wording_section(ws_prior_formula, ws_prior_values, ws_target, source_start, source_end, target_start):
+    """Copy one detected wording section into the target sheet and mark copied cells."""
+    table_like = is_adjustment_wording_section(ws_prior_formula, source_start)
+    source_len = source_end - source_start + 1
+    target_starts = find_wording_start_rows(ws_target)
+    next_target_start = next((row for row in target_starts if row > target_start), None)
+    target_end = find_wording_section_end(ws_target, target_start, next_target_start)
+    target_len = max(1, target_end - target_start + 1)
+    if table_like:
+        ensure_target_wording_capacity(ws_target, target_start, target_len, source_len)
+
+    copied = 0
+    max_col = min(max(ws_prior_formula.max_column, ws_target.max_column), 40)
+    for offset, source_row in enumerate(range(source_start, source_end + 1)):
+        target_row = target_start + offset
+        for col in range(1, max_col + 1):
+            value = source_wording_value(
+                ws_prior_formula.cell(row=source_row, column=col),
+                ws_prior_values.cell(row=source_row, column=col),
+                table_like=table_like,
+            )
+            if value in (None, ""):
+                continue
+            if set_cell_value(ws_target, target_row, col, value):
+                highlight_wording_cell(ws_target, target_row, col)
+                copied += 1
+
+    return copied
+
+
+def process_wording_sections(wb_prior_formula, wb_prior_values, wb_new, subject_code, subject_config, warnings_list=None):
+    """Roll prior-year wording sections into the new workbook as an optional post-step."""
+    copied = 0
+    touched_sheets = set()
+
+    for sheet_name in wb_prior_formula.sheetnames:
+        if wb_prior_formula[sheet_name].sheet_state != "visible":
+            continue
+        if normalize_text(sheet_name).startswith("汇总"):
+            continue
+        if subject_code == "C" and normalize_text(sheet_name).upper().startswith("C.03CUTOFF"):
+            continue
+        if subject_code == "J1" and (
+            normalize_text(sheet_name).startswith("J.00")
+            or normalize_text(sheet_name).startswith("J.01")
+            or normalize_text(sheet_name).startswith("J.03")
+        ):
+            continue
+        if subject_code == "L2" and (
+            normalize_text(sheet_name).startswith("L2.00")
+            or normalize_text(sheet_name).startswith("L2.02")
+        ):
+            continue
+        if subject_code == "N" and (
+            normalize_text(sheet_name).startswith("N.02")
+            or normalize_text(sheet_name).startswith("N.03")
+        ):
+            continue
+        if subject_code == "UexpVCVD" and (
+            normalize_text(sheet_name).startswith("VC.00")
+            or normalize_text(sheet_name).startswith("VD.00")
+        ):
+            continue
+        if subject_code == "Uexp":
+            continue
+        if sheet_name not in wb_new.sheetnames or sheet_name not in wb_prior_values.sheetnames:
+            continue
+
+        ws_prior_formula = wb_prior_formula[sheet_name]
+        ws_prior_values = wb_prior_values[sheet_name]
+        ws_target = wb_new[sheet_name]
+        source_starts = find_wording_start_rows(ws_prior_formula)
+        if not source_starts:
+            continue
+
+        last_target_start = 0
+        for idx, source_start in enumerate(source_starts):
+            next_source_start = source_starts[idx + 1] if idx + 1 < len(source_starts) else None
+            source_end = find_wording_section_end(ws_prior_formula, source_start, next_source_start)
+            if source_end < source_start:
+                continue
+
+            source_keywords = get_matching_wording_keywords(ws_prior_formula, source_start)
+            target_start = find_target_wording_start(ws_target, source_start, source_keywords)
+            if target_start <= last_target_start:
+                continue
+
+            section_copied = copy_wording_section(
+                ws_prior_formula,
+                ws_prior_values,
+                ws_target,
+                source_start,
+                source_end,
+                target_start,
+            )
+            if section_copied:
+                copied += section_copied
+                touched_sheets.add(sheet_name)
+                last_target_start = target_start
+
+    if copied and warnings_list is not None:
+        warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+
+    return copied, sorted(touched_sheets)
+
+
+def copy_wording_value_to_cell(ws_prior_formula, ws_prior_values, ws_target, source_row, source_col, target_row=None, target_col=None, table_like=False):
+    """Copy one wording value and highlight only the copied target cell."""
+    target_row = target_row or source_row
+    target_col = target_col or source_col
+    value = source_wording_value(
+        ws_prior_formula.cell(row=source_row, column=source_col),
+        ws_prior_values.cell(row=source_row, column=source_col),
+        table_like=table_like,
+    )
+    if value in (None, ""):
+        return 0
+    if set_cell_value(ws_target, target_row, target_col, value):
+        highlight_wording_cell(ws_target, target_row, target_col)
+        return 1
+    return 0
+
+
+def clear_target_cells(ws_target, row_start, row_end, col_start, col_end):
+    """Clear a small target area before placing a wording table."""
+    for row in range(row_start, row_end + 1):
+        for col in range(col_start, col_end + 1):
+            set_cell_value(ws_target, row, col, None)
+
+
+def process_j1_lead_wording(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll J.00 Lead wording sections into their fixed template areas."""
+    copied = 0
+
+    for row in (28, 29):
+        copied += copy_wording_value_to_cell(
+            ws_prior_formula,
+            ws_prior_values,
+            ws_new,
+            row,
+            3,
+        )
+
+    copied += copy_wording_value_to_cell(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        54,
+        2,
+    )
+
+    clear_target_cells(ws_new, 61, 63, 2, 6)
+    for row in range(61, 64):
+        for col in range(2, 7):
+            copied += copy_wording_value_to_cell(
+                ws_prior_formula,
+                ws_prior_values,
+                ws_new,
+                row,
+                col,
+                table_like=True,
+            )
+
+    return copied
+
+
+def process_j1_agree_notes(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll the J.01 Notes body into the existing Notes box."""
+    copied = 0
+    notes_row = None
+    for row in range(1, ws_new.max_row + 1):
+        if row_has_any_keyword(ws_new, row, ("Notes", "Notes：", "Notes:")):
+            notes_row = row + 1
+            break
+    if not notes_row:
+        return 0
+
+    prior_notes_row = None
+    for row in range(1, ws_prior_formula.max_row + 1):
+        if row_has_any_keyword(ws_prior_formula, row, ("Notes", "Notes：", "Notes:")):
+            prior_notes_row = row + 1
+            break
+    if not prior_notes_row:
+        return 0
+
+    copied += copy_wording_value_to_cell(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        prior_notes_row,
+        2,
+        notes_row,
+        2,
+    )
+    return copied
+
+
+def process_j1_cip_long_aging(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll populated J.03 CIP long-aging test rows when prior year has content."""
+    header_row = find_header_row(ws_prior_formula, "样本序号", (1, 40))
+    target_header_row = find_header_row(ws_new, "样本序号", (1, 40))
+    if not header_row or not target_header_row:
+        return 0
+
+    prior_records = []
+    for row in range(header_row + 1, ws_prior_formula.max_row + 1):
+        if row_has_any_keyword(ws_prior_formula, row, ("标记图例",)):
+            break
+        if row_has_content(ws_prior_formula, row, 3, min(ws_prior_formula.max_column, 9)):
+            prior_records.append(row)
+
+    if not prior_records:
+        return 0
+
+    marker_row = find_row_containing(ws_new, "标记图例", (target_header_row + 1, ws_new.max_row))
+    if not marker_row:
+        marker_row = ws_new.max_row + 1
+    available_rows = max(0, marker_row - target_header_row - 1)
+    extra_rows = max(0, len(prior_records) - available_rows)
+    if extra_rows:
+        insert_rows_preserving_sheet_metadata(ws_new, marker_row, extra_rows)
+        for offset in range(extra_rows):
+            copy_row_shape(ws_new, marker_row - 1, marker_row + offset, translate_formula=True)
+
+    copied = 0
+    for idx, source_row in enumerate(prior_records):
+        target_row = target_header_row + 1 + idx
+        for col in range(2, min(ws_prior_formula.max_column, 9) + 1):
+            copied += copy_wording_value_to_cell(
+                ws_prior_formula,
+                ws_prior_values,
+                ws_new,
+                source_row,
+                col,
+                target_row,
+                col,
+                table_like=True,
+            )
+    return copied
+
+
+def process_j1_wording_sections(wb_prior_formula, wb_prior_values, wb_new, warnings_list=None):
+    """Roll J1 wording sections that need fixed template placement."""
+    copied = 0
+    if "J.00  Lead Sheet" in wb_prior_formula.sheetnames and "J.00  Lead Sheet" in wb_new.sheetnames:
+        copied += process_j1_lead_wording(
+            wb_prior_formula["J.00  Lead Sheet"],
+            wb_prior_values["J.00  Lead Sheet"],
+            wb_new["J.00  Lead Sheet"],
+        )
+    if "J.01 Agree SL to GL" in wb_prior_formula.sheetnames and "J.01 Agree SL to GL" in wb_new.sheetnames:
+        copied += process_j1_agree_notes(
+            wb_prior_formula["J.01 Agree SL to GL"],
+            wb_prior_values["J.01 Agree SL to GL"],
+            wb_new["J.01 Agree SL to GL"],
+        )
+
+    prior_j03_sheet = next((s for s in wb_prior_formula.sheetnames if normalize_text(s).startswith("J.03")), None)
+    new_j03_sheet = next((s for s in wb_new.sheetnames if normalize_text(s).startswith("J.03")), None)
+    if prior_j03_sheet and new_j03_sheet:
+        copied += process_j1_cip_long_aging(
+            wb_prior_formula[prior_j03_sheet],
+            wb_prior_values[prior_j03_sheet],
+            wb_new[new_j03_sheet],
+        )
+
+    if copied and warnings_list is not None:
+        warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+    return copied
+
+
+def unmerge_ranges_intersecting(ws, row_start, row_end, col_start, col_end):
+    """Unmerge ranges touching a bounded area."""
+    for merged_range in list(ws.merged_cells.ranges):
+        if (
+            merged_range.max_row < row_start
+            or merged_range.min_row > row_end
+            or merged_range.max_col < col_start
+            or merged_range.min_col > col_end
+        ):
+            continue
+        try:
+            ws.unmerge_cells(str(merged_range))
+        except KeyError:
+            continue
+
+
+def process_l2_lead_expectation_table(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll L2 prior-year expectation table into the current placeholder area."""
+    prior_header_row = None
+    for row in range(1, min(ws_prior_formula.max_row, 40) + 1):
+        if normalize_text(ws_prior_formula.cell(row=row, column=3).value) == "账户变动":
+            prior_header_row = row
+            break
+    if not prior_header_row:
+        return 0
+
+    target_start_row = 14
+    data_rows = []
+    for row in range(prior_header_row + 1, prior_header_row + 6):
+        label = ws_prior_values.cell(row=row, column=3).value
+        detail = ws_prior_values.cell(row=row, column=4).value
+        if label not in (None, "") or detail not in (None, ""):
+            data_rows.append((label, detail))
+
+    if not data_rows:
+        return 0
+
+    unmerge_ranges_intersecting(ws_new, target_start_row, target_start_row + 2, 3, 7)
+    clear_target_cells(ws_new, target_start_row, target_start_row + 2, 3, 7)
+
+    set_cell_value(ws_new, target_start_row, 3, "账户变动")
+    set_cell_value(ws_new, target_start_row, 4, "预期的依据和理由")
+    set_cell_value(ws_new, target_start_row + 1, 3, "\n".join(str(label or "") for label, _ in data_rows))
+    set_cell_value(ws_new, target_start_row + 1, 4, "\n".join(str(detail or "") for _, detail in data_rows))
+
+    try:
+        ws_new.merge_cells(start_row=target_start_row, start_column=4, end_row=target_start_row, end_column=7)
+        ws_new.merge_cells(start_row=target_start_row + 1, start_column=3, end_row=target_start_row + 2, end_column=3)
+        ws_new.merge_cells(start_row=target_start_row + 1, start_column=4, end_row=target_start_row + 2, end_column=7)
+    except ValueError:
+        pass
+
+    for row in range(target_start_row, target_start_row + 3):
+        ws_new.row_dimensions[row].height = 24 if row == target_start_row else 68
+
+    copied = 0
+    for row, col in (
+        (target_start_row, 3),
+        (target_start_row, 4),
+        (target_start_row + 1, 3),
+        (target_start_row + 1, 4),
+    ):
+        cell = ws_new.cell(row=row, column=col)
+        if isinstance(cell, MergedCell):
+            continue
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        highlight_wording_cell(ws_new, row, col)
+        copied += 1
+
+    return copied
+
+
+def process_l2_lead_notes(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll L2 Lead Notes body into the current Notes box."""
+    prior_notes_row = next(
+        (
+            row for row in range(1, ws_prior_formula.max_row + 1)
+            if normalize_text(ws_prior_formula.cell(row=row, column=2).value) == "Notes"
+        ),
+        None,
+    )
+    target_notes_row = next(
+        (
+            row for row in range(1, ws_new.max_row + 1)
+            if normalize_text(ws_new.cell(row=row, column=2).value) == "Notes"
+        ),
+        None,
+    )
+    if not prior_notes_row or not target_notes_row:
+        return 0
+
+    return copy_wording_value_to_cell(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        prior_notes_row + 1,
+        3,
+        target_notes_row + 1,
+        3,
+    )
+
+
+def process_l2_wording_sections(wb_prior_formula, wb_prior_values, wb_new, warnings_list=None):
+    """Roll L2 wording sections that need placement across changed templates."""
+    sheet_name = "L2.00 Lead"
+    if sheet_name not in wb_prior_formula.sheetnames or sheet_name not in wb_new.sheetnames:
+        return 0
+
+    copied = 0
+    copied += process_l2_lead_expectation_table(
+        wb_prior_formula[sheet_name],
+        wb_prior_values[sheet_name],
+        wb_new[sheet_name],
+    )
+    copied += process_l2_lead_notes(
+        wb_prior_formula[sheet_name],
+        wb_prior_values[sheet_name],
+        wb_new[sheet_name],
+    )
+
+    if copied and warnings_list is not None:
+        warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+    return copied
+
+
 def clear_blank_borders(ws, row_start=1, row_end=None, col_start=1, col_end=None):
     """Remove borders from blank cells only."""
     no_border = Border()
@@ -575,6 +1407,119 @@ def row_has_content(ws, row, col_start, col_end):
         ws.cell(row=row, column=col).value not in (None, "")
         for col in range(col_start, col_end + 1)
     )
+
+
+def apply_thin_borders(ws, row_start, row_end, col_start, col_end):
+    """Apply a simple table grid to a bounded area."""
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for row in range(row_start, row_end + 1):
+        for col in range(col_start, col_end + 1):
+            cell = ws.cell(row=row, column=col)
+            if not isinstance(cell, MergedCell):
+                cell.border = copy(border)
+
+
+def apply_borders_to_content_rows(ws, row_start, row_end, col_start, col_end):
+    """Apply borders only to rows with content in a bounded area."""
+    for row in range(row_start, row_end + 1):
+        if row_has_content(ws, row, col_start, col_end):
+            apply_thin_borders(ws, row, row, col_start, col_end)
+
+
+def reset_dimension_styles(ws, last_row, last_col):
+    """Drop whole-row/whole-column styles that create borders in empty sheet areas."""
+    from openpyxl.styles.cell_style import StyleArray
+
+    for row_idx in list(ws.row_dimensions):
+        row_dim = ws.row_dimensions[row_idx]
+        row_dim._style = StyleArray()
+        if row_idx > last_row:
+            del ws.row_dimensions[row_idx]
+
+    for col_key in list(ws.column_dimensions):
+        col_dim = ws.column_dimensions[col_key]
+        min_col = col_dim.min or column_index_from_string(col_key)
+        max_col = col_dim.max or min_col
+        if min_col > last_col:
+            del ws.column_dimensions[col_key]
+            continue
+        if max_col > last_col:
+            col_dim.max = last_col
+        col_dim._style = StyleArray()
+
+
+def find_last_useful_row(ws):
+    """Find the last row containing values or merged text."""
+    last_row = 1
+    for row in range(1, ws.max_row + 1):
+        if row_has_content(ws, row, 1, ws.max_column):
+            last_row = row
+    for merged_range in ws.merged_cells.ranges:
+        if ws.cell(merged_range.min_row, merged_range.min_col).value not in (None, ""):
+            last_row = max(last_row, merged_range.max_row)
+    return last_row
+
+
+def prune_empty_cells_outside_area(ws, last_row, last_col):
+    """Remove blank style-only cells outside the area we want Excel to display."""
+    for key, cell in list(ws._cells.items()):
+        row, col = key
+        if row <= last_row and col <= last_col:
+            continue
+        if cell.value in (None, ""):
+            del ws._cells[key]
+
+
+def tidy_n_detail_sheet_borders(ws, header_row, total_row):
+    """Remove copied empty-grid borders from N.01.01 while keeping useful tables framed."""
+    clear_borders(ws, 1, ws.max_row, 1, ws.max_column)
+
+    useful_col_end = min(ws.max_column, 24)
+    useful_row_end = find_last_useful_row(ws)
+    reset_dimension_styles(ws, useful_row_end, useful_col_end)
+    prune_empty_cells_outside_area(ws, useful_row_end, useful_col_end)
+
+    table_start_row = max(1, header_row - 1)
+    table_end_row = total_row or ws.max_row
+    if table_end_row + 1 <= ws.max_row and row_has_content(ws, table_end_row + 1, 2, ws.max_column):
+        table_end_row += 1
+    apply_thin_borders(ws, table_start_row, table_end_row, 2, useful_col_end)
+
+    aging_summary_row = find_row_containing(ws, "账龄汇总表", (table_end_row + 1, ws.max_row))
+    if aging_summary_row:
+        apply_borders_to_content_rows(
+            ws,
+            aging_summary_row,
+            min(aging_summary_row + 12, ws.max_row),
+            2,
+            min(useful_col_end, 6),
+        )
+
+    wording_start_row = find_row_containing(ws, "对于单项变动金额", (table_end_row + 1, ws.max_row))
+    if wording_start_row:
+        apply_borders_to_content_rows(
+            ws,
+            wording_start_row,
+            ws.max_row,
+            2,
+            min(useful_col_end, 8),
+        )
+
+        for merged_range in ws.merged_cells.ranges:
+            if (
+                merged_range.min_row >= wording_start_row
+                and merged_range.min_col >= 2
+                and merged_range.max_col <= min(useful_col_end, 8)
+                and ws.cell(merged_range.min_row, merged_range.min_col).value not in (None, "")
+            ):
+                apply_thin_borders(
+                    ws,
+                    merged_range.min_row,
+                    merged_range.max_row,
+                    merged_range.min_col,
+                    merged_range.max_col,
+                )
 
 
 def update_total_row_formulas(ws, total_row, old_total_row, data_start_row, data_end_row):
@@ -1122,6 +2067,8 @@ def process_lead_sheet(ws_prior, ws_new, ws_prior_values, company_info, bs_date,
             break
         if row_contains_any(ws_prior_values, row, ["check with", "Diff", "波动说明", "Notes：", "Notes:"], columns=range(2, min(8, ws_prior_values.max_column) + 1)):
             break
+        if is_table_end_marker_row(ws_prior_values, row):
+            continue
         if row_contains_any(ws_prior_values, row, ["Rx"], columns=range(2, min(8, ws_prior_values.max_column) + 1)):
             continue
 
@@ -1140,16 +2087,49 @@ def process_lead_sheet(ws_prior, ws_new, ws_prior_values, company_info, bs_date,
             new_total_row = row
             break
 
+    if lead_config.get("match_existing_rows_only", False):
+        copied = 0
+        if new_total_row:
+            for _, descriptor_values, closing_val in prior_data_rows:
+                if closing_val is None:
+                    continue
+                descriptor_keys = [
+                    normalize_text(value)
+                    for value in descriptor_values.values()
+                    if value not in (None, "")
+                ]
+                if not descriptor_keys:
+                    continue
+                for row in range(new_data_start_row, new_total_row):
+                    if row_contains_any(ws_new, row, ["Rx", "A3", "Diff", "波动说明"], columns=range(2, min(8, ws_new.max_column) + 1)):
+                        continue
+                    row_keys = [
+                        normalize_text(ws_new.cell(row=row, column=col).value)
+                        for col in sorted({col for _, col in descriptor_cols})
+                    ]
+                    if not any(key and key in row_keys for key in descriptor_keys):
+                        continue
+                    existing_value = ws_new.cell(row=row, column=opening_col).value
+                    keeps_formula = isinstance(existing_value, str) and existing_value.startswith("=")
+                    if overwrite_opening_formulas or not keeps_formula:
+                        if set_cell_value(ws_new, row, opening_col, closing_val):
+                            copied += 1
+                    break
+        return copied
+
     template_data_count = 0
     if new_total_row:
+        available_template_rows = 0
         for row in range(new_data_start_row, new_total_row):
             if row_contains_any(ws_new, row, ["Rx", "A3", "Diff", "波动说明"], columns=range(2, min(8, ws_new.max_column) + 1)):
                 continue
+            available_template_rows += 1
             if any(
                 ws_new.cell(row=row, column=col).value not in (None, "")
                 for col in sorted({col for _, col in descriptor_cols} | {opening_col})
             ):
                 template_data_count += 1
+        template_data_count = max(template_data_count, available_template_rows)
     else:
         template_data_count = len(prior_data_rows)
 
@@ -1184,6 +2164,12 @@ def process_lead_sheet(ws_prior, ws_new, ws_prior_values, company_info, bs_date,
         if closing_val is not None and (overwrite_opening_formulas or not keeps_formula):
             if set_cell_value(ws_new, target_row, opening_col, closing_val):
                 copied += 1
+
+    if lead_config.get("clear_extra_template_rows", False) and new_total_row:
+        first_extra_row = new_data_start_row + len(prior_data_rows)
+        for row in range(first_extra_row, new_total_row):
+            for col in range(1, min(ws_new.max_column, 20) + 1):
+                set_cell_value(ws_new, row, col, None)
 
     clear_current_cols = lead_config.get("clear_current_period_cols", [])
     if clear_current_cols:
@@ -1305,15 +2291,7 @@ def process_k01(ws_prior, ws_new, k01_config):
     if not k01_config.get("has_k01", False):
         return 0
 
-    # 1. 复制表头行
     header_row = k01_config.get("header_row", 10)
-    for col in range(1, ws_prior.max_column + 1):
-        prior_cell = ws_prior.cell(row=header_row, column=col)
-        new_cell = ws_new.cell(row=header_row, column=col)
-        if isinstance(new_cell, MergedCell):
-            continue
-        if prior_cell.value is not None:
-            new_cell.value = prior_cell.value
 
     roll_forward_groups = k01_config.get("roll_forward_groups", [])
     if roll_forward_groups:
@@ -1336,6 +2314,13 @@ def process_k01(ws_prior, ws_new, k01_config):
                     copied += 1
         return copied
 
+    if k01_config.get("match_categories", False):
+        return process_k01_by_category(ws_prior, ws_new, header_row, k01_config)
+
+    dynamic_copied = process_k01_by_category(ws_prior, ws_new, header_row, {})
+    if dynamic_copied:
+        return dynamic_copied
+
     # 2. 复制年初余额数据
     opening_balance_rows = k01_config.get("opening_balance_rows", [])
     copied = 0
@@ -1347,6 +2332,150 @@ def process_k01(ws_prior, ws_new, k01_config):
             if prior_cell.value is not None:
                 new_cell.value = prior_cell.value
                 copied += 1
+
+    return copied
+
+
+def find_k01_category_groups(ws, header_row):
+    """Find K.01 category groups by the category label row."""
+    groups = []
+    for col in range(1, ws.max_column + 1):
+        label = ws.cell(row=header_row, column=col).value
+        if not label:
+            continue
+        label_key = normalize_text(label)
+        book_header = normalize_text(ws.cell(row=header_row + 1, column=col - 1).value) if col > 1 else ""
+        adjust_header = normalize_text(ws.cell(row=header_row + 1, column=col).value)
+        audit_header = normalize_text(ws.cell(row=header_row + 1, column=col + 1).value)
+        if "账面数" not in book_header or "调整" not in adjust_header or "审定数" not in audit_header:
+            continue
+        groups.append({
+            "name": str(label).strip(),
+            "name_key": label_key,
+            "book_col": col - 1,
+            "adjust_col": col,
+            "audit_col": col + 1,
+        })
+    return groups
+
+
+def find_k01_section_rows(ws):
+    """Return K.01 roll-forward source/target rows by section label."""
+    ordered_keys = ("cost", "depreciation", "impairment")
+    sections = OrderedDict((key, {}) for key in ordered_keys)
+    opening_rows = []
+    closing_rows = []
+
+    for row in range(1, ws.max_row + 1):
+        detail_value = normalize_text(ws.cell(row=row, column=3).value)
+        if "年初余额" in detail_value:
+            opening_rows.append(row)
+        if "年末余额" in detail_value or "期末余额" in detail_value:
+            closing_rows.append(row)
+
+    for idx, key in enumerate(ordered_keys):
+        if idx < len(opening_rows):
+            sections[key]["opening"] = opening_rows[idx]
+        if idx < len(closing_rows):
+            sections[key]["closing"] = closing_rows[idx]
+    return sections
+
+
+def category_matches(source_key, target_key):
+    """Return True when a prior category should roll to a target category."""
+    if not source_key or not target_key:
+        return False
+    if "合计" in source_key or "合计" in target_key:
+        return False
+    if "…" in target_key or "【" in target_key:
+        return False
+    return source_key in target_key or target_key in source_key
+
+
+def is_placeholder_category(category_key):
+    if not category_key:
+        return True
+    return any(marker in category_key for marker in ("…", "...", "【", "】", "[…]"))
+
+
+def is_total_category(category_key):
+    return "合计" in category_key or "总计" in category_key
+
+
+def process_k01_by_category(ws_prior, ws_new, header_row, k01_config):
+    """Roll prior year-end K.01 balances to current opening rows by category."""
+    prior_groups = [
+        group for group in find_k01_category_groups(ws_prior, header_row)
+        if not is_total_category(group["name_key"]) and not is_placeholder_category(group["name_key"])
+    ]
+    configured_categories = k01_config.get("categories", [])
+    dynamic_target_groups = [
+        group for group in find_k01_category_groups(ws_new, header_row)
+        if not is_total_category(group["name_key"])
+    ]
+    if dynamic_target_groups:
+        target_groups = dynamic_target_groups
+    elif configured_categories:
+        target_groups = []
+        for category in configured_categories:
+            audit_col = category.get("audit_col")
+            book_col = category.get("book_col")
+            if not audit_col or not book_col:
+                continue
+            target_groups.append({
+                "name": category.get("name", ""),
+                "name_key": normalize_text(category.get("name", "")),
+                "book_col": book_col,
+                "adjust_col": audit_col - 1,
+                "audit_col": audit_col,
+            })
+    else:
+        target_groups = []
+
+    sections_prior = find_k01_section_rows(ws_prior)
+    sections_new = find_k01_section_rows(ws_new)
+
+    copied = 0
+    used_source_indexes = set()
+    for target in target_groups:
+        target_key = target["name_key"]
+        if is_total_category(target_key):
+            continue
+
+        source = None
+        if not is_placeholder_category(target_key):
+            for source_index, group in enumerate(prior_groups):
+                if source_index in used_source_indexes:
+                    continue
+                if category_matches(group["name_key"], target_key):
+                    source = group
+                    used_source_indexes.add(source_index)
+                    break
+
+        if source is None:
+            for source_index, group in enumerate(prior_groups):
+                if source_index not in used_source_indexes:
+                    source = group
+                    used_source_indexes.add(source_index)
+                    break
+
+        if not source:
+            continue
+
+        set_cell_value(ws_new, header_row, target["adjust_col"], source["name"])
+        for section_key in ("cost", "depreciation", "impairment"):
+            source_row = sections_prior.get(section_key, {}).get("closing")
+            target_row = sections_new.get(section_key, {}).get("opening")
+            if not source_row or not target_row:
+                continue
+            for source_col, target_col in (
+                (source["book_col"], target["book_col"]),
+                (source["adjust_col"], target["adjust_col"]),
+            ):
+                value = ws_prior.cell(row=source_row, column=source_col).value
+                if value is not None:
+                    set_cell_value(ws_new, target_row, target_col, value)
+                    copied += 1
 
     return copied
 
@@ -1476,31 +2605,42 @@ def process_l1_from_rollforward_schedule(ws_schedule, ws_new_lead, ws_new_k01, s
 
     # L1.01.1 Agree SL to GL: prior year-end rolls to current opening rows.
     schedule_groups = [g for g in find_schedule_group_columns(ws_schedule) if "合计" not in g["name_key"]]
-    target_order = ["土地", "非专利", "专利", "软件", "其他"]
-    target_labels = {
-        "土地": "土地使用权",
-        "非专利": "非专利技术",
-        "专利": "专利权",
-        "软件": "软件",
-        "其他": "其他",
-    }
-    target_groups = {}
-    for key, col in zip(target_order, [6, 9, 12, 15, 18]):
-        target_groups[key] = {
-            "name": target_labels[key],
-            "name_key": key,
-            "book_col": col - 1,
-            "adjust_col": col,
-        }
+    available_targets = [
+        group for group in find_k01_category_groups(ws_new_k01, 10)
+        if not is_total_category(group["name_key"])
+    ]
+    assigned_targets = []
+    used_target_indexes = set()
+    for schedule_group in schedule_groups:
+        target = None
+        source_key = l1_category_key(schedule_group["name"])
+        for target_index, candidate in enumerate(available_targets):
+            if target_index in used_target_indexes or is_placeholder_category(candidate["name_key"]):
+                continue
+            if category_matches(source_key, l1_category_key(candidate["name"])):
+                target = candidate
+                used_target_indexes.add(target_index)
+                break
+        if target is None:
+            for target_index, candidate in enumerate(available_targets):
+                if target_index not in used_target_indexes:
+                    target = candidate
+                    used_target_indexes.add(target_index)
+                    break
+        if target is not None:
+            assigned_targets.append((schedule_group, target))
+
+    section_rows_new = find_k01_section_rows(ws_new_k01)
+    section_targets = [
+        (["原值"], section_rows_new.get("cost", {}).get("opening")),
+        (["累计摊销", "累计折旧"], section_rows_new.get("depreciation", {}).get("opening")),
+        (["减值准备"], section_rows_new.get("impairment", {}).get("opening")),
+    ]
 
     target_values = {}
 
-    for schedule_group in schedule_groups:
-        target = target_groups.get(l1_category_key(schedule_group["name"]))
-        if not target:
-            continue
-
-        target_key = target["name_key"]
+    for schedule_group, target in assigned_targets:
+        target_key = f"col_{target['adjust_col']}"
         if target_key not in target_values:
             target_values[target_key] = {
                 "target": target,
@@ -1509,7 +2649,9 @@ def process_l1_from_rollforward_schedule(ws_schedule, ws_new_lead, ws_new_k01, s
             }
         target_values[target_key]["source_names"].append(schedule_group["name"])
 
-        for section_names, target_row in [(["原值"], 12), (["累计摊销", "累计折旧"], 18), (["减值准备"], 23)]:
+        for section_names, target_row in section_targets:
+            if not target_row:
+                continue
             source_row = None
             for section_name in section_names:
                 source_row = find_schedule_section_row(ws_schedule, section_name, "年末余额")
@@ -1548,6 +2690,1033 @@ def process_l1_from_rollforward_schedule(ws_schedule, ws_new_lead, ws_new_k01, s
     return copied
 
 
+def process_l2_bkd(ws_prior_values, ws_new):
+    """Roll L2.01.1 project-level prior year-end balances to current openings."""
+    header_row = find_header_row(ws_prior_values, "项目编码", (1, 80))
+    new_header_row = find_header_row(ws_new, "项目编码", (1, 80))
+    if not header_row or not new_header_row:
+        return 0
+
+    prior_total_row = find_total_row_after(ws_prior_values, header_row)
+    new_total_row = find_total_row_after(ws_new, new_header_row)
+    if not prior_total_row or not new_total_row:
+        return 0
+
+    records = []
+    for row in range(header_row + 1, prior_total_row):
+        if is_table_end_marker_row(ws_prior_values, row):
+            continue
+        project_code = ws_prior_values.cell(row=row, column=3).value
+        project_name = ws_prior_values.cell(row=row, column=4).value
+        if project_code in (None, "") and project_name in (None, ""):
+            continue
+
+        original_closing = ws_prior_values.cell(row=row, column=14).value
+        if original_closing is None:
+            original_closing = ws_prior_values.cell(row=row, column=12).value
+        amort_closing = ws_prior_values.cell(row=row, column=18).value
+
+        records.append({
+            "code": project_code,
+            "name": project_name,
+            "initial_date": ws_prior_values.cell(row=row, column=5).value,
+            "life": ws_prior_values.cell(row=row, column=6).value,
+            "original_opening": original_closing,
+            "amort_opening": amort_closing,
+        })
+
+    if not records:
+        return 0
+
+    data_start_row = new_header_row + 1
+    available_rows = max(0, new_total_row - data_start_row)
+    extra_rows = max(0, len(records) - available_rows)
+
+    formula_source_row = None
+    for row in range(new_total_row - 1, data_start_row - 1, -1):
+        if any(
+            isinstance(ws_new.cell(row=row, column=col).value, str)
+            and ws_new.cell(row=row, column=col).value.startswith("=")
+            for col in (12, 14, 18)
+        ):
+            formula_source_row = row
+            break
+    formula_source_row = formula_source_row or data_start_row
+
+    if extra_rows:
+        insert_rows_preserving_sheet_metadata(ws_new, new_total_row, extra_rows)
+        for offset in range(extra_rows):
+            copy_row_shape(ws_new, formula_source_row, new_total_row + offset, translate_formula=True)
+        new_total_row += extra_rows
+
+    copied = 0
+    for idx, record in enumerate(records):
+        target_row = data_start_row + idx
+        if target_row != formula_source_row:
+            copy_row_shape(ws_new, formula_source_row, target_row, translate_formula=True)
+
+        values = {
+            3: record["code"],
+            4: record["name"],
+            5: record["initial_date"],
+            6: record["life"],
+            7: record["original_opening"],
+            8: None,
+            9: None,
+            10: None,
+            11: None,
+            13: None,
+            15: record["amort_opening"],
+            16: None,
+            17: None,
+        }
+        for col, value in values.items():
+            if set_cell_value(ws_new, target_row, col, value):
+                copied += 1
+
+        set_cell_value(ws_new, target_row, 12, f"=G{target_row}+H{target_row}-I{target_row}")
+        set_cell_value(ws_new, target_row, 14, f"=L{target_row}+M{target_row}")
+        set_cell_value(ws_new, target_row, 18, f"=O{target_row}+P{target_row}-Q{target_row}")
+        ws_new.cell(row=target_row, column=5).number_format = "yyyy/mm/dd"
+
+    for row in range(data_start_row + len(records), new_total_row):
+        for col in (3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 17):
+            set_cell_value(ws_new, row, col, None)
+        if row < new_total_row:
+            set_cell_value(ws_new, row, 12, f"=G{row}+H{row}-I{row}")
+            set_cell_value(ws_new, row, 14, f"=L{row}+M{row}")
+            set_cell_value(ws_new, row, 18, f"=O{row}+P{row}-Q{row}")
+
+    last_sum_row = data_start_row + len(records) - 1
+    for col in (7, 8, 9, 12, 13, 14, 15, 16, 17, 18):
+        col_letter = get_column_letter(col)
+        set_cell_value(ws_new, new_total_row, col, f"=SUM({col_letter}{new_header_row}:{col_letter}{last_sum_row})")
+
+    return copied
+
+
+def find_first_table_end_marker(ws, start_row, end_row):
+    """Find the first /T marker row in a bounded table area."""
+    for row in range(start_row, end_row):
+        if is_table_end_marker_row(ws, row):
+            return row
+    return None
+
+
+def find_expense_bkd_header_row(ws):
+    """Find the Uexp BKD detail header row from stable header labels."""
+    for row in range(1, min(ws.max_row, 100) + 1):
+        row_text = " ".join(
+            str(ws.cell(row=row, column=col).value or "")
+            for col in range(1, min(ws.max_column, 30) + 1)
+        )
+        key = normalize_text(row_text)
+        if "科目编码" in key and "科目名称" in key and ("上期末审定数" in key or "上期审定数" in key):
+            return row
+    return None
+
+
+def find_expense_bkd_total_row(ws, header_row):
+    """Find a Uexp BKD total row by label or by SUM formulas."""
+    total_row = find_total_row_after(ws, header_row)
+    if total_row:
+        return total_row
+
+    for row in range(header_row + 1, min(ws.max_row, header_row + 80) + 1):
+        sum_formula_count = 0
+        for col in range(1, min(ws.max_column, 25) + 1):
+            value = ws.cell(row=row, column=col).value
+            if isinstance(value, str) and value.startswith("=SUM("):
+                sum_formula_count += 1
+        if sum_formula_count >= 3:
+            return row
+
+    for row in range(header_row + 1, min(ws.max_row, header_row + 80) + 1):
+        if row_contains_any(ws, row, ["Rx", "A3", "Diff", "波动说明"], columns=range(1, min(18, ws.max_column) + 1)):
+            candidate = row - 1
+            while candidate > header_row and not row_has_content(ws, candidate, 1, min(18, ws.max_column)):
+                candidate -= 1
+            return candidate if candidate > header_row else None
+    return None
+
+
+def set_expense_bkd_row_formulas(ws, row, header_cols, total_row=None, data_last_row=None):
+    """Refresh row formulas in an expense BKD table using discovered columns."""
+    book_col = header_cols.get("book")
+    book_adjust_col = header_cols.get("book_adjust")
+    unaudited_col = header_cols.get("unaudited")
+    structure_col = header_cols.get("structure")
+    audit_adjust_col = header_cols.get("audit_adjust")
+    audited_col = header_cols.get("audited")
+    py_col = header_cols.get("py")
+    variance_col = header_cols.get("variance")
+    rate_col = header_cols.get("rate")
+
+    if total_row and data_last_row:
+        for key in ("book", "book_adjust", "unaudited", "structure", "audit_adjust", "audited", "py"):
+            col = header_cols.get(key)
+            if col:
+                col_letter = get_column_letter(col)
+                set_cell_value(ws, total_row, col, f"=SUM({col_letter}{header_cols['data_start_row']}:{col_letter}{data_last_row})")
+        if variance_col and audited_col and py_col:
+            set_cell_value(ws, total_row, variance_col, f"={get_column_letter(audited_col)}{total_row}-{get_column_letter(py_col)}{total_row}")
+        if rate_col and py_col and variance_col:
+            set_cell_value(
+                ws,
+                total_row,
+                rate_col,
+                f"=IF({get_column_letter(py_col)}{total_row}<>0,{get_column_letter(variance_col)}{total_row}/{get_column_letter(py_col)}{total_row},1)"
+            )
+        return
+
+    if unaudited_col and book_col and book_adjust_col:
+        set_cell_value(ws, row, unaudited_col, f"={get_column_letter(book_col)}{row}+{get_column_letter(book_adjust_col)}{row}")
+    if structure_col and unaudited_col and header_cols.get("total_row"):
+        total_row = header_cols["total_row"]
+        unaudited_letter = get_column_letter(unaudited_col)
+        set_cell_value(ws, row, structure_col, f'=IF(${unaudited_letter}${total_row}<>0,{unaudited_letter}{row}/${unaudited_letter}${total_row},"")')
+    if audited_col and unaudited_col and audit_adjust_col:
+        set_cell_value(ws, row, audited_col, f"={get_column_letter(unaudited_col)}{row}+{get_column_letter(audit_adjust_col)}{row}")
+    if variance_col and audited_col and py_col:
+        set_cell_value(ws, row, variance_col, f"={get_column_letter(audited_col)}{row}-{get_column_letter(py_col)}{row}")
+    if rate_col and py_col and variance_col:
+        set_cell_value(
+            ws,
+            row,
+            rate_col,
+            f"=IF({get_column_letter(py_col)}{row}<>0,{get_column_letter(variance_col)}{row}/{get_column_letter(py_col)}{row},1)"
+        )
+
+
+def process_expense_bkd_prior_current_to_py(ws_prior_values, ws_new):
+    """Roll prior Uexp BKD current audited values into the current PY column."""
+    prior_header_row = find_expense_bkd_header_row(ws_prior_values)
+    new_header_row = find_expense_bkd_header_row(ws_new)
+    if not prior_header_row or not new_header_row:
+        return 0, None
+
+    source_current_col = (
+        find_header_col(ws_prior_values, prior_header_row, ["本期账面审定数", "本期审定数", "本期数"])
+        or find_header_col_near(ws_prior_values, prior_header_row, ["本期账面审定数", "本期审定数"], row_offsets=(-1, 0))
+    )
+    target_py_col = (
+        find_header_col(ws_new, new_header_row, ["上期末审定数", "上期审定数", "上年数", "PY"])
+        or find_header_col_near(ws_new, new_header_row, ["上期末审定数", "上期审定数", "上年数", "PY"], row_offsets=(-1, 0))
+    )
+    if not source_current_col or not target_py_col:
+        return 0, None
+
+    descriptor_rules = [
+        (["账套名称/账套编码", "账套名称", "账套编码"], ["账套名称/账套编码", "账套名称", "账套编码"]),
+        (["科目编码"], ["科目编码"]),
+        (["科目名称"], ["科目名称"]),
+    ]
+    descriptor_cols = []
+    for source_keywords, target_keywords in descriptor_rules:
+        source_col = find_header_col(ws_prior_values, prior_header_row, source_keywords)
+        target_col = find_header_col(ws_new, new_header_row, target_keywords)
+        if source_col and target_col:
+            descriptor_cols.append((source_col, target_col))
+
+    if not descriptor_cols:
+        return 0, None
+
+    prior_total_row = find_expense_bkd_total_row(ws_prior_values, prior_header_row)
+    new_total_row = find_expense_bkd_total_row(ws_new, new_header_row)
+    if not prior_total_row or not new_total_row:
+        return 0, None
+
+    records = []
+    for row in range(prior_header_row + 1, prior_total_row):
+        if is_table_end_marker_row(ws_prior_values, row):
+            continue
+        descriptors = {
+            target_col: ws_prior_values.cell(row=row, column=source_col).value
+            for source_col, target_col in descriptor_cols
+        }
+        if not any(value not in (None, "") for value in descriptors.values()):
+            continue
+        records.append((descriptors, ws_prior_values.cell(row=row, column=source_current_col).value))
+
+    if not records:
+        return 0, new_total_row
+
+    data_start_row = new_header_row + 1
+    marker_row = find_first_table_end_marker(ws_new, data_start_row, new_total_row) or new_total_row
+    available_rows = max(0, marker_row - data_start_row)
+    extra_rows = max(0, len(records) - available_rows)
+    formula_source_row = max(data_start_row, marker_row - 1)
+    old_total_row = new_total_row
+
+    if extra_rows:
+        insert_rows_preserving_sheet_metadata(ws_new, marker_row, extra_rows)
+        for offset in range(extra_rows):
+            copy_row_shape(ws_new, formula_source_row, marker_row + offset, translate_formula=True)
+        marker_row += extra_rows
+        new_total_row += extra_rows
+
+    header_cols = {
+        "header_row": new_header_row,
+        "data_start_row": data_start_row,
+        "total_row": new_total_row,
+        "book": find_header_col(ws_new, new_header_row, ["本期账面数"]),
+        "book_adjust": find_header_col(ws_new, new_header_row, ["本期账表调整数", "账表调整数"]),
+        "unaudited": find_header_col(ws_new, new_header_row, ["本期账面未审数", "本期未审数"]),
+        "structure": find_header_col(ws_new, new_header_row, ["结构比"]),
+        "audit_adjust": find_header_col(ws_new, new_header_row, ["本期审计调整金数", "本期审计调整金额", "审计调整数"]),
+        "audited": find_header_col(ws_new, new_header_row, ["本期账面审定数", "本期审定数"]),
+        "py": target_py_col,
+        "variance": find_header_col(ws_new, new_header_row, ["变动额", "变动金额"]),
+        "rate": find_header_col(ws_new, new_header_row, ["变动率", "变动%"]),
+    }
+
+    copied = 0
+    target_descriptor_cols = [target_col for _, target_col in descriptor_cols]
+    for idx, (descriptors, current_value) in enumerate(records):
+        target_row = data_start_row + idx
+        copy_row_shape(ws_new, formula_source_row, target_row, translate_formula=True)
+        for target_col, value in descriptors.items():
+            if set_cell_value(ws_new, target_row, target_col, value):
+                copied += 1
+        if set_cell_value(ws_new, target_row, target_py_col, current_value):
+            copied += 1
+        for key in ("book", "book_adjust", "audit_adjust"):
+            col = header_cols.get(key)
+            if col:
+                set_cell_value(ws_new, target_row, col, None)
+        set_expense_bkd_row_formulas(ws_new, target_row, header_cols)
+
+    for row in range(data_start_row + len(records), marker_row):
+        for col in set(target_descriptor_cols + [target_py_col]):
+            set_cell_value(ws_new, row, col, None)
+        for key in ("book", "book_adjust", "audit_adjust"):
+            col = header_cols.get(key)
+            if col:
+                set_cell_value(ws_new, row, col, None)
+        set_expense_bkd_row_formulas(ws_new, row, header_cols)
+
+    set_expense_bkd_row_formulas(
+        ws_new,
+        new_total_row,
+        header_cols,
+        total_row=new_total_row,
+        data_last_row=data_start_row + len(records) - 1,
+    )
+
+    if extra_rows:
+        shift_local_formula_refs_after_insert(ws_new, old_total_row, extra_rows)
+
+    return copied, new_total_row
+
+
+def update_lead_bkd_total_references(ws_lead, bkd_sheet_name, total_row):
+    """Point Uexp lead formulas at the actual BKD total row after dynamic insertion."""
+    if not total_row:
+        return 0
+
+    updated = 0
+    sheet_ref_pattern = re.compile(r"('?" + re.escape(bkd_sheet_name) + r"'?!\$?[A-Z]{1,3})\$?\d+")
+    for row in range(1, min(ws_lead.max_row, 80) + 1):
+        row_refs_sheet = any(
+            ws_lead.cell(row=row, column=col).value == bkd_sheet_name
+            for col in (3, 4)
+        )
+        if not row_refs_sheet:
+            continue
+        for col in range(1, min(ws_lead.max_column, 20) + 1):
+            value = ws_lead.cell(row=row, column=col).value
+            if not isinstance(value, str) or bkd_sheet_name not in value:
+                continue
+            new_value = sheet_ref_pattern.sub(lambda match: f"{match.group(1)}{total_row}", value)
+            if new_value != value:
+                ws_lead.cell(row=row, column=col).value = new_value
+                updated += 1
+        break
+    return updated
+
+
+def find_q1_bkd_header_row(ws):
+    """Find Q1.01 movement table header row."""
+    for row in range(1, min(ws.max_row, 80) + 1):
+        row_text = " ".join(
+            str(ws.cell(row=row, column=col).value or "")
+            for col in range(1, min(ws.max_column, 25) + 1)
+        )
+        key = normalize_text(row_text)
+        if "债务描述" in key and "期初余额" in key and "期末余额" in key:
+            return row
+    return None
+
+
+def is_q1_interest_row(ws, row, desc_col):
+    """Return True when a Q1.01 row represents accrued interest."""
+    return "利息" in normalize_text(ws.cell(row=row, column=desc_col).value)
+
+
+def set_q1_bkd_row_formulas(ws, row, cols, interest=False):
+    """Refresh Q1.01 movement formulas for a detail row."""
+    opening = cols.get("opening")
+    add = cols.get("add")
+    repayment = cols.get("repayment")
+    paid_interest = cols.get("paid_interest")
+    accrued_interest = cols.get("accrued_interest")
+    reclass = cols.get("reclass")
+    fx = cols.get("fx")
+    ending = cols.get("ending")
+    tb = cols.get("tb")
+    diff = cols.get("diff")
+    current = cols.get("current")
+    noncurrent = cols.get("noncurrent")
+
+    if ending:
+        if interest and opening and accrued_interest and paid_interest and reclass and fx:
+            set_cell_value(ws, row, ending, f"={get_column_letter(opening)}{row}+{get_column_letter(accrued_interest)}{row}-{get_column_letter(paid_interest)}{row}+{get_column_letter(reclass)}{row}+{get_column_letter(fx)}{row}")
+        elif opening and add and repayment and reclass and fx:
+            set_cell_value(ws, row, ending, f"={get_column_letter(opening)}{row}+{get_column_letter(add)}{row}-{get_column_letter(repayment)}{row}+{get_column_letter(reclass)}{row}+{get_column_letter(fx)}{row}")
+    if diff and ending and tb:
+        set_cell_value(ws, row, diff, f"={get_column_letter(ending)}{row}-{get_column_letter(tb)}{row}")
+    if noncurrent and ending and current:
+        set_cell_value(ws, row, noncurrent, f"={get_column_letter(ending)}{row}-{get_column_letter(current)}{row}")
+
+
+def process_q1_bkd(ws_prior_values, ws_new):
+    """Roll prior Q1.01 ending balances to current opening balances."""
+    prior_header_row = find_q1_bkd_header_row(ws_prior_values)
+    new_header_row = find_q1_bkd_header_row(ws_new)
+    if not prior_header_row or not new_header_row:
+        return 0, None
+
+    prior_total_row = find_total_row_after(ws_prior_values, prior_header_row)
+    new_total_row = find_total_row_after(ws_new, new_header_row)
+    if not prior_total_row or not new_total_row:
+        return 0, None
+
+    prior_desc_col = find_header_col(ws_prior_values, prior_header_row, ["债务描述/债务工具", "债务描述"])
+    prior_account_col = find_header_col(ws_prior_values, prior_header_row, ["总账账户"])
+    prior_ending_col = find_header_col(ws_prior_values, prior_header_row, ["期末余额"])
+    prior_current_col = find_header_col(ws_prior_values, prior_header_row, ["债务工具的流动部分"])
+    prior_covenant_col = find_header_col(ws_prior_values, prior_header_row, ["契约条件"])
+
+    new_desc_col = find_header_col(ws_new, new_header_row, ["债务描述/债务工具", "债务描述"])
+    new_account_col = find_header_col(ws_new, new_header_row, ["总账账户"])
+    new_opening_col = find_header_col(ws_new, new_header_row, ["期初余额"])
+    new_current_col = find_header_col(ws_new, new_header_row, ["债务工具的流动部分"])
+    new_covenant_col = find_header_col(ws_new, new_header_row, ["契约条件"])
+
+    if not all([prior_desc_col, prior_ending_col, new_desc_col, new_opening_col]):
+        return 0, None
+
+    records = []
+    for row in range(prior_header_row + 1, prior_total_row):
+        desc = ws_prior_values.cell(row=row, column=prior_desc_col).value
+        account = ws_prior_values.cell(row=row, column=prior_account_col).value if prior_account_col else None
+        ending = ws_prior_values.cell(row=row, column=prior_ending_col).value
+        if desc in (None, "") and account in (None, ""):
+            continue
+        records.append({
+            "desc": desc,
+            "account": account,
+            "opening": ending,
+            "current": ws_prior_values.cell(row=row, column=prior_current_col).value if prior_current_col else None,
+            "covenant": ws_prior_values.cell(row=row, column=prior_covenant_col).value if prior_covenant_col else None,
+            "interest": "利息" in normalize_text(desc),
+        })
+
+    if not records:
+        return 0, new_total_row
+
+    data_start_row = new_header_row + 1
+    available_rows = max(0, new_total_row - data_start_row)
+    extra_rows = max(0, len(records) - available_rows)
+    principal_shape_row = data_start_row
+    interest_shape_row = next(
+        (row for row in range(data_start_row, new_total_row) if is_q1_interest_row(ws_new, row, new_desc_col)),
+        data_start_row,
+    )
+    old_total_row = new_total_row
+
+    if extra_rows:
+        insert_rows_preserving_sheet_metadata(ws_new, new_total_row, extra_rows)
+        for offset in range(extra_rows):
+            record_idx = available_rows + offset
+            source_row = interest_shape_row if records[record_idx]["interest"] else principal_shape_row
+            copy_row_shape(ws_new, source_row, old_total_row + offset, translate_formula=True)
+        new_total_row += extra_rows
+        shift_local_formula_refs_after_insert(ws_new, old_total_row, extra_rows)
+
+    cols = {
+        "opening": new_opening_col,
+        "add": find_header_col(ws_new, new_header_row, ["本金增加/支取"]),
+        "repayment": find_header_col(ws_new, new_header_row, ["本金减免/偿还"]),
+        "paid_interest": find_header_col(ws_new, new_header_row, ["偿还的利息费用"]),
+        "accrued_interest": find_header_col(ws_new, new_header_row, ["计提的利息费用"]),
+        "reclass": find_header_col(ws_new, new_header_row, ["重分类"]),
+        "fx": find_header_col(ws_new, new_header_row, ["外币重新计量"]),
+        "ending": find_header_col(ws_new, new_header_row, ["期末余额"]),
+        "tb": find_header_col(ws_new, new_header_row, ["试算表余额"]),
+        "diff": find_header_col(ws_new, new_header_row, ["差额"]),
+        "current": new_current_col,
+        "noncurrent": find_header_col(ws_new, new_header_row, ["非流动部分"]),
+    }
+
+    copied = 0
+    for idx, record in enumerate(records):
+        target_row = data_start_row + idx
+        source_row = interest_shape_row if record["interest"] else principal_shape_row
+        if target_row != source_row:
+            copy_row_shape(ws_new, source_row, target_row, translate_formula=True)
+        for col, value in (
+            (new_desc_col, record["desc"]),
+            (new_account_col, record["account"] if new_account_col else None),
+            (new_opening_col, record["opening"]),
+            (new_current_col, record["current"] if new_current_col else None),
+            (new_covenant_col, record["covenant"] if new_covenant_col else None),
+        ):
+            if col and set_cell_value(ws_new, target_row, col, value):
+                copied += 1
+        for key in ("add", "repayment", "paid_interest", "accrued_interest", "reclass", "fx", "tb"):
+            col = cols.get(key)
+            if col:
+                set_cell_value(ws_new, target_row, col, None)
+        set_q1_bkd_row_formulas(ws_new, target_row, cols, interest=record["interest"])
+
+    for row in range(data_start_row + len(records), new_total_row):
+        for col in range(2, min(ws_new.max_column, 18) + 1):
+            set_cell_value(ws_new, row, col, None)
+
+    data_last_row = data_start_row + len(records) - 1
+    for key in ("opening", "add", "repayment", "paid_interest", "accrued_interest", "reclass", "fx", "ending", "tb", "diff", "current"):
+        col = cols.get(key)
+        if col:
+            col_letter = get_column_letter(col)
+            set_cell_value(ws_new, new_total_row, col, f"=SUM({col_letter}{data_start_row}:{col_letter}{data_last_row})")
+    if cols.get("noncurrent") and cols.get("ending") and cols.get("current"):
+        set_cell_value(ws_new, new_total_row, cols["noncurrent"], f"={get_column_letter(cols['ending'])}{new_total_row}-{get_column_letter(cols['current'])}{new_total_row}")
+    if new_covenant_col:
+        col_letter = get_column_letter(new_covenant_col)
+        set_cell_value(ws_new, new_total_row, new_covenant_col, f'=COUNTIF({col_letter}{data_start_row}:{col_letter}{data_last_row},"是")')
+
+    interest_row = next(
+        (data_start_row + idx for idx, record in enumerate(records) if record["interest"]),
+        None,
+    )
+    if interest_row and cols.get("paid_interest") and cols.get("opening") and cols.get("ending") and cols.get("accrued_interest"):
+        check_row = find_row_containing(ws_new, "利息计提合理性检查", (new_total_row + 1, min(ws_new.max_row, new_total_row + 10)))
+        if check_row:
+            set_cell_value(
+                ws_new,
+                check_row,
+                3,
+                f"={get_column_letter(cols['paid_interest'])}{new_total_row}-{get_column_letter(cols['opening'])}{interest_row}+{get_column_letter(cols['ending'])}{interest_row}-{get_column_letter(cols['accrued_interest'])}{new_total_row}",
+            )
+
+    return copied, new_total_row
+
+
+def copy_changed_constant_cell(ws_prior, ws_new, source_row, source_col, target_row=None, target_col=None):
+    """Copy a non-formula constant when it adds information to the target."""
+    target_row = target_row or source_row
+    target_col = target_col or source_col
+    value = ws_prior.cell(row=source_row, column=source_col).value
+    if value in (None, "") or (isinstance(value, str) and value.startswith("=")):
+        return 0
+
+    target_cell = ws_new.cell(row=target_row, column=target_col)
+    if target_cell.value == value:
+        return 0
+    if set_cell_value(ws_new, target_row, target_col, value):
+        highlight_wording_cell(ws_new, target_row, target_col)
+        return 1
+    return 0
+
+
+def copy_q1_covenant_rows_between_markers(ws_prior, ws_new, start_keyword, end_keyword=None, columns=range(2, 10)):
+    """Copy changed constants in a covenant section located by row markers."""
+    source_start = find_row_containing(ws_prior, start_keyword, (1, ws_prior.max_row))
+    target_start = find_row_containing(ws_new, start_keyword, (1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+
+    if end_keyword:
+        source_end_marker = find_row_containing(ws_prior, end_keyword, (source_start + 1, ws_prior.max_row))
+        target_end_marker = find_row_containing(ws_new, end_keyword, (target_start + 1, ws_new.max_row))
+        source_end = (source_end_marker - 1) if source_end_marker else min(source_start + 20, ws_prior.max_row)
+        target_end = (target_end_marker - 1) if target_end_marker else min(target_start + 20, ws_new.max_row)
+    else:
+        source_end = ws_prior.max_row
+        target_end = ws_new.max_row
+
+    source_len = max(0, source_end - source_start)
+    target_len = max(0, target_end - target_start)
+    rows_to_insert = max(0, source_len - target_len)
+    if rows_to_insert and end_keyword:
+        insert_at = target_end + 1
+        source_shape_row = max(target_start + 1, target_end)
+        insert_rows_preserving_sheet_metadata(ws_new, insert_at, rows_to_insert)
+        for offset in range(rows_to_insert):
+            copy_row_shape(ws_new, source_shape_row, insert_at + offset, translate_formula=True)
+
+    copied = 0
+    for offset in range(1, source_len + 1):
+        source_row = source_start + offset
+        target_row = target_start + offset
+        for col in columns:
+            copied += copy_changed_constant_cell(ws_prior, ws_new, source_row, col, target_row, col)
+    return copied
+
+
+def copy_q1_covenant_labeled_values(ws_prior, ws_new):
+    """Copy numeric/input values beside stable covenant labels."""
+    copied = 0
+    labels = (
+        "具有限制性契约的借款数量",
+        "减：本金已分类为流动负债的借款数量",
+    )
+    for label in labels:
+        source_row = find_row_containing(ws_prior, label, (1, ws_prior.max_row))
+        target_row = find_row_containing(ws_new, label, (1, ws_new.max_row))
+        if not source_row or not target_row:
+            continue
+        for col in range(3, min(10, ws_prior.max_column, ws_new.max_column) + 1):
+            copied += copy_changed_constant_cell(ws_prior, ws_new, source_row, col, target_row, col)
+    return copied
+
+
+def process_q1_covenant_sheet(ws_prior, ws_new):
+    """Roll prior Q1.05 covenant inputs and highlight copied fields."""
+    copied = 0
+
+    copied += copy_q1_covenant_rows_between_markers(
+        ws_prior,
+        ws_new,
+        "记录为识别我们合规测试所涵盖的债务工具而执行的程序",
+        "具有限制性契约的借款数量",
+        columns=range(2, 10),
+    )
+    copied += copy_q1_covenant_labeled_values(ws_prior, ws_new)
+    copied += copy_q1_covenant_rows_between_markers(
+        ws_prior,
+        ws_new,
+        "编号",
+        "标记图例",
+        columns=range(2, 10),
+    )
+    copied += copy_q1_covenant_rows_between_markers(
+        ws_prior,
+        ws_new,
+        "标记图例",
+        "附注",
+        columns=range(2, 10),
+    )
+    copied += copy_q1_covenant_rows_between_markers(
+        ws_prior,
+        ws_new,
+        "附注",
+        None,
+        columns=range(2, 10),
+    )
+
+    return copied
+
+
+def process_vcvd_cutoff_table2(ws_prior, ws_new):
+    """Roll VC&VD.01.4 cutoff test table 2 strategy text and highlight copied fields."""
+    copied = 0
+    source_start = find_row_containing(ws_prior, "表2", (1, ws_prior.max_row))
+    target_start = find_row_containing(ws_new, "表2", (1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+
+    source_end_marker = find_row_containing(ws_prior, "表3", (source_start + 1, ws_prior.max_row))
+    target_end_marker = find_row_containing(ws_new, "表3", (target_start + 1, ws_new.max_row))
+    source_end = (source_end_marker - 1) if source_end_marker else min(source_start + 20, ws_prior.max_row)
+    target_end = (target_end_marker - 1) if target_end_marker else min(target_start + 20, ws_new.max_row)
+
+    source_len = max(0, source_end - source_start)
+    target_len = max(0, target_end - target_start)
+    rows_to_insert = max(0, source_len - target_len)
+    if rows_to_insert and target_end_marker:
+        insert_at = target_end_marker
+        source_shape_row = max(target_start + 1, target_end)
+        insert_rows_preserving_sheet_metadata(ws_new, insert_at, rows_to_insert)
+        for offset in range(rows_to_insert):
+            copy_row_shape(ws_new, source_shape_row, insert_at + offset, translate_formula=True)
+
+    max_col = min(ws_prior.max_column, ws_new.max_column, 12)
+    for offset in range(1, source_len + 1):
+        source_row = source_start + offset
+        target_row = target_start + offset
+        for col in range(1, max_col + 1):
+            copied += copy_changed_constant_cell(ws_prior, ws_new, source_row, col, target_row, col)
+
+    return copied
+
+
+def find_row_containing_any(ws, keywords, search_range=None):
+    """Find the first row containing any of the provided keywords."""
+    start, end = search_range or (1, ws.max_row)
+    for row in range(start, min(end, ws.max_row) + 1):
+        if row_has_any_keyword(ws, row, keywords, 1, min(ws.max_column, 30)):
+            return row
+    return None
+
+
+def find_next_vcvd_bkd_section_row(ws, start_row, markers):
+    """Find the next BKD wording section marker after a source/target anchor."""
+    for row in range(start_row + 1, min(ws.max_row, start_row + 120) + 1):
+        if row_has_any_keyword(ws, row, markers, 1, min(ws.max_column, 30)):
+            return row
+    return None
+
+
+def copy_vcvd_bkd_section(ws_prior, ws_new, anchor_keywords, next_markers, insert_before_keywords=None, columns=range(2, 10)):
+    """Copy one VC/VD BKD wording section by anchors without touching table 1 judgment columns."""
+    source_start = find_row_containing_any(ws_prior, anchor_keywords)
+    if not source_start:
+        return 0
+
+    source_next = find_next_vcvd_bkd_section_row(ws_prior, source_start, next_markers)
+    if source_next:
+        source_end = source_next - 1
+    else:
+        source_end = min(ws_prior.max_row, source_start + 20)
+        while source_end > source_start and not row_has_content(ws_prior, source_end, 1, min(ws_prior.max_column, 30)):
+            source_end -= 1
+
+    if source_end < source_start:
+        return 0
+
+    target_start = find_row_containing_any(ws_new, anchor_keywords)
+    if target_start:
+        target_next = find_next_vcvd_bkd_section_row(ws_new, target_start, next_markers)
+        target_end = (target_next - 1) if target_next else min(ws_new.max_row, target_start + 20)
+    else:
+        insert_before = find_row_containing_any(ws_new, insert_before_keywords or next_markers)
+        if not insert_before:
+            insert_before = ws_new.max_row + 1
+        source_len = source_end - source_start + 1
+        insert_rows_preserving_sheet_metadata(ws_new, insert_before, source_len)
+        source_shape_row = max(1, insert_before - 1)
+        for offset in range(source_len):
+            copy_row_shape(ws_new, source_shape_row, insert_before + offset, translate_formula=True)
+        target_start = insert_before
+        target_end = insert_before + source_len - 1
+
+    source_len = source_end - source_start + 1
+    target_len = max(1, target_end - target_start + 1)
+    rows_to_insert = max(0, source_len - target_len)
+    if rows_to_insert:
+        insert_at = target_end + 1
+        source_shape_row = max(target_start, target_end)
+        insert_rows_preserving_sheet_metadata(ws_new, insert_at, rows_to_insert)
+        for offset in range(rows_to_insert):
+            copy_row_shape(ws_new, source_shape_row, insert_at + offset, translate_formula=True)
+
+    copied = 0
+    for offset in range(source_len):
+        source_row = source_start + offset
+        target_row = target_start + offset
+        for col in columns:
+            copied += copy_changed_constant_cell(ws_prior, ws_new, source_row, col, target_row, col)
+    return copied
+
+
+def process_vcvd_bkd_wording(ws_prior, ws_new):
+    """Roll VC/VD BKD expected fluctuation, ARP wording, and adjustment summary."""
+    copied = 0
+    section_markers = (
+        "波动范围",
+        "表1",
+        "波动说明",
+        "预期波动分析",
+        "ARP波动说明",
+        "ARP",
+        "调整汇总表",
+    )
+
+    copied += copy_vcvd_bkd_section(
+        ws_prior,
+        ws_new,
+        ("在下文中描述我们当期对账户波动的预期", "预期波动分析"),
+        ("波动范围", "表1"),
+        columns=range(2, 10),
+    )
+    copied += copy_vcvd_bkd_section(
+        ws_prior,
+        ws_new,
+        ("波动说明",),
+        ("ARP波动说明", "ARP", "调整汇总表"),
+        insert_before_keywords=("调整汇总表",),
+        columns=range(2, 10),
+    )
+    copied += copy_vcvd_bkd_section(
+        ws_prior,
+        ws_new,
+        ("ARP波动说明", "ARP"),
+        ("调整汇总表",),
+        insert_before_keywords=("调整汇总表",),
+        columns=range(2, 10),
+    )
+    copied += copy_vcvd_bkd_section(
+        ws_prior,
+        ws_new,
+        ("调整汇总表",),
+        section_markers,
+        insert_before_keywords=None,
+        columns=range(2, 18),
+    )
+
+    return copied
+
+
+def copy_section_with_shape(ws_prior, ws_new, source_start, source_end, target_start, col_start=1, col_end=None, highlight=True):
+    """Copy a small worksheet section with styles so bordered wording boxes stay intact."""
+    col_end = col_end or min(ws_prior.max_column, ws_new.max_column)
+    source_len = source_end - source_start + 1
+    target_end = target_start + source_len - 1
+    if target_end > ws_new.max_row:
+        insert_rows_preserving_sheet_metadata(ws_new, ws_new.max_row + 1, target_end - ws_new.max_row)
+
+    unmerge_ranges_intersecting(ws_new, target_start, target_end, col_start, col_end)
+
+    copied = 0
+    for offset in range(source_len):
+        source_row = source_start + offset
+        target_row = target_start + offset
+        try:
+            ws_new.row_dimensions[target_row].height = ws_prior.row_dimensions[source_row].height
+        except Exception:
+            pass
+        for col in range(col_start, min(col_end, ws_prior.max_column, ws_new.max_column) + 1):
+            source_cell = ws_prior.cell(row=source_row, column=col)
+            target_cell = ws_new.cell(row=target_row, column=col)
+            if isinstance(target_cell, MergedCell):
+                continue
+            copy_cell_shape(source_cell, target_cell, translate_formula=False)
+            if source_cell.value not in (None, ""):
+                copied += 1
+                if highlight:
+                    highlight_wording_cell(ws_new, target_row, col)
+
+    for merged_range in list(ws_prior.merged_cells.ranges):
+        if (
+            merged_range.min_row < source_start
+            or merged_range.max_row > source_end
+            or merged_range.min_col < col_start
+            or merged_range.max_col > col_end
+        ):
+            continue
+        row_shift = target_start - source_start
+        try:
+            ws_new.merge_cells(
+                start_row=merged_range.min_row + row_shift,
+                start_column=merged_range.min_col,
+                end_row=merged_range.max_row + row_shift,
+                end_column=merged_range.max_col,
+            )
+        except ValueError:
+            pass
+    return copied
+
+
+def copy_exact_section_with_shape(ws_prior, ws_new, source_start, source_end, target_start,
+                                  target_existing_end=None, col_start=1, col_end=None,
+                                  highlight=True):
+    """Replace a target section with a source section, preserving row shape and merged cells."""
+    source_len = source_end - source_start + 1
+    if source_len <= 0:
+        return 0
+
+    if target_existing_end is None or target_existing_end < target_start:
+        target_existing_len = 1
+    else:
+        target_existing_len = target_existing_end - target_start + 1
+
+    if source_len > target_existing_len:
+        insert_rows_preserving_sheet_metadata(ws_new, target_start + target_existing_len, source_len - target_existing_len)
+
+    return copy_section_with_shape(
+        ws_prior,
+        ws_new,
+        source_start,
+        source_end,
+        target_start,
+        col_start=col_start,
+        col_end=col_end,
+        highlight=highlight,
+    )
+
+
+def find_section_end_by_blank_or_markers(ws, start_row, markers=(), max_rows=30):
+    """Find a compact section end by next marker or trailing blank run."""
+    last_content = start_row
+    blank_run = 0
+    for row in range(start_row, min(ws.max_row, start_row + max_rows) + 1):
+        if row > start_row and markers and row_has_any_keyword(ws, row, markers, 1, min(ws.max_column, 30)):
+            return max(start_row, row - 1)
+        if row_has_content(ws, row, 1, min(ws.max_column, 30)):
+            last_content = row
+            blank_run = 0
+        else:
+            blank_run += 1
+            if row > start_row and blank_run >= 3:
+                return last_content
+    return last_content
+
+
+def process_uexp_lead_adjustment_summary(ws_prior, ws_new):
+    """Roll Uexp Lead adjustment summary with borders/styles intact."""
+    source_start = find_row_containing(ws_prior, "调整汇总表", (1, ws_prior.max_row))
+    target_start = find_row_containing(ws_new, "调整汇总表", (1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+
+    source_end = find_section_end_by_blank_or_markers(
+        ws_prior,
+        source_start,
+        markers=("Notes", "表1", "目标"),
+        max_rows=20,
+    )
+    copied = copy_exact_section_with_shape(
+        ws_prior,
+        ws_new,
+        source_start,
+        source_end,
+        target_start,
+        target_existing_end=target_start + (source_end - source_start),
+        col_start=2,
+        col_end=min(ws_prior.max_column, ws_new.max_column, 12),
+        highlight=True,
+    )
+    apply_thin_borders(ws_new, target_start, target_start + (source_end - source_start), 3, 7)
+    return copied
+
+
+def process_uexp_lead_expected_wording(ws_prior, ws_new):
+    """Roll Uexp Lead expected fluctuation wording."""
+    source_start = find_row_containing(ws_prior, "在下文中描述我们当期对账户波动的预期", (1, ws_prior.max_row))
+    target_start = find_row_containing(ws_new, "在下文中描述我们当期对账户波动的预期", (1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+
+    source_end = find_section_end_by_blank_or_markers(
+        ws_prior,
+        source_start,
+        markers=("波动幅度", "波动范围", "表1"),
+        max_rows=20,
+    )
+    target_next = find_row_containing_any(ws_new, ("波动幅度", "波动范围", "表1"), (target_start + 1, ws_new.max_row))
+    target_existing_end = (target_next - 1) if target_next else target_start + (source_end - source_start)
+
+    return copy_exact_section_with_shape(
+        ws_prior,
+        ws_new,
+        source_start,
+        source_end,
+        target_start,
+        target_existing_end=target_existing_end,
+        col_start=2,
+        col_end=min(ws_prior.max_column, ws_new.max_column, 12),
+        highlight=True,
+    )
+
+
+def process_uexp_lead_notes(ws_prior, ws_new):
+    """Roll Uexp Lead Notes text into the current notes box."""
+    source_row = find_row_containing(ws_prior, "Notes", (1, ws_prior.max_row))
+    target_row = find_row_containing(ws_new, "Notes", (1, ws_new.max_row))
+    if not source_row or not target_row:
+        return 0
+
+    copied = 0
+    for offset in range(0, 6):
+        source = source_row + offset
+        target = target_row + offset
+        for col in range(2, min(ws_prior.max_column, ws_new.max_column, 12) + 1):
+            copied += copy_changed_constant_cell(ws_prior, ws_new, source, col, target, col)
+    return copied
+
+
+def process_uexp_lead_wording(ws_prior, ws_new):
+    """Roll Uexp Lead notes and adjustment summary using dedicated sections."""
+    copied = 0
+    copied += process_uexp_lead_expected_wording(ws_prior, ws_new)
+    copied += process_uexp_lead_notes(ws_prior, ws_new)
+    copied += process_uexp_lead_adjustment_summary(ws_prior, ws_new)
+    return copied
+
+
+def process_uexp_bkd_expected_wording(ws_prior, ws_new):
+    """Roll Uexp finance BKD expected fluctuation wording, excluding the procedure table."""
+    source_start = find_row_containing(ws_prior, "在下文中描述我们当期对账户波动的预期", (1, ws_prior.max_row))
+    target_start = find_row_containing(ws_new, "在下文中描述我们当期对账户波动的预期", (1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+
+    source_end = find_section_end_by_blank_or_markers(
+        ws_prior,
+        source_start,
+        markers=("波动范围", "表1"),
+        max_rows=20,
+    )
+    target_next = find_row_containing_any(ws_new, ("波动范围", "表1"), (target_start + 1, ws_new.max_row))
+    target_existing_end = (target_next - 1) if target_next else target_start + (source_end - source_start)
+
+    return copy_exact_section_with_shape(
+        ws_prior,
+        ws_new,
+        source_start,
+        source_end,
+        target_start,
+        target_existing_end=target_existing_end,
+        col_start=2,
+        col_end=min(ws_prior.max_column, ws_new.max_column, 12),
+        highlight=True,
+    )
+
+
+def process_uexp_bkd_notes(ws_prior, ws_new):
+    """Roll Uexp finance BKD bottom Notes/NB explanations."""
+    source_header = find_expense_bkd_header_row(ws_prior)
+    target_header = find_expense_bkd_header_row(ws_new)
+    source_total = find_expense_bkd_total_row(ws_prior, source_header) if source_header else None
+    target_total = find_expense_bkd_total_row(ws_new, target_header) if target_header else None
+
+    source_start = find_row_containing(ws_prior, "Notes", ((source_total or 1) + 1, ws_prior.max_row))
+    target_start = find_row_containing(ws_new, "Notes", ((target_total or 1) + 1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+
+    source_end = source_start
+    for row in range(source_start, min(ws_prior.max_row, source_start + 80) + 1):
+        if row > source_start and row_has_any_keyword(ws_prior, row, ("调整汇总表", "表2", "截止"), 1, min(ws_prior.max_column, 30)):
+            break
+        if row_has_content(ws_prior, row, 1, min(ws_prior.max_column, 30)):
+            source_end = row
+    target_end_marker = find_row_containing(ws_new, "表2", (target_start + 1, ws_new.max_row))
+    target_existing_end = (target_end_marker - 1) if target_end_marker else target_start + (source_end - source_start)
+
+    return copy_exact_section_with_shape(
+        ws_prior,
+        ws_new,
+        source_start,
+        source_end,
+        target_start,
+        target_existing_end=target_existing_end,
+        col_start=2,
+        col_end=min(ws_prior.max_column, ws_new.max_column, 18),
+        highlight=True,
+    )
+
+
+def process_uexp_finance_bkd_wording(ws_prior, ws_new):
+    """Roll the required Uexp finance BKD wording areas only."""
+    copied = 0
+    copied += process_uexp_bkd_expected_wording(ws_prior, ws_new)
+    copied += process_uexp_bkd_notes(ws_prior, ws_new)
+    return copied
+
+
 def process_l103_policy_table(ws_prior, ws_new):
     """Roll L1.03 table 2 prior-year policy information into the new workbook."""
     copied = 0
@@ -1582,6 +3751,104 @@ def process_l103_policy_table(ws_prior, ws_new):
             copied += 1
         if data["reason"] is not None:
             set_cell_value(ws_new, row, 7, data["reason"])
+            copied += 1
+
+    return copied
+
+
+def process_k033_depreciation_policy(ws_prior, ws_new):
+    """Roll prior K.03.3 current depreciation policy into the new review table."""
+    copied = 0
+    policy_rows = []
+
+    for row in range(1, ws_prior.max_row + 1):
+        category = ws_prior.cell(row=row, column=2).value
+        useful_life = ws_prior.cell(row=row, column=3).value
+        residual_rate = ws_prior.cell(row=row, column=4).value
+        if category in (None, "") or useful_life in (None, ""):
+            continue
+        category_key = normalize_text(category)
+        if (
+            not category_key
+            or "折旧" in category_key
+            or "资产类别" in category_key
+            or "Notes" in category_key
+            or "表1" in category_key
+            or "公司折旧政策" in category_key
+        ):
+            continue
+        policy_rows.append({
+            "category": category,
+            "life": useful_life,
+            "residual_rate": residual_rate,
+        })
+
+    if not policy_rows:
+        return 0
+
+    start_row = None
+    for row in range(1, ws_new.max_row + 1):
+        row_values = [normalize_text(ws_new.cell(row=row, column=col).value) for col in range(2, 8)]
+        if any("折旧政策" in value for value in row_values) and any("使用寿命" in value for value in row_values):
+            start_row = row + 1
+            break
+
+    for row in range(1, ws_new.max_row + 1):
+        if start_row is not None:
+            break
+        if normalize_text(ws_new.cell(row=row, column=2).value) == "":
+            formula_cell = ws_new.cell(row=row, column=5).value
+            if isinstance(formula_cell, str) and formula_cell.startswith("="):
+                start_row = row
+                break
+    if start_row is None:
+        start_row = 13
+
+    existing_capacity = 0
+    for row in range(start_row, ws_new.max_row + 1):
+        if normalize_text(ws_new.cell(row=row, column=2).value) == "Notes":
+            break
+        if ws_new.cell(row=row, column=5).value is not None:
+            existing_capacity += 1
+
+    rows_to_insert = max(0, len(policy_rows) - existing_capacity)
+    if rows_to_insert:
+        insert_at = start_row + existing_capacity
+        source_row = max(start_row, insert_at - 1)
+        insert_rows_preserving_sheet_metadata(ws_new, insert_at, rows_to_insert)
+        for offset in range(rows_to_insert):
+            copy_row_shape(ws_new, source_row, insert_at + offset, translate_formula=True)
+
+    for offset, policy in enumerate(policy_rows):
+        row = start_row + offset
+        for col, value in (
+            (2, policy["category"]),
+            (6, policy["life"]),
+            (7, policy["residual_rate"]),
+        ):
+            set_cell_value(ws_new, row, col, value)
+            copied += 1
+        set_cell_value(ws_new, row, 3, None)
+        set_cell_value(ws_new, row, 4, None)
+
+    notes_value = None
+    for row in range(1, ws_prior.max_row + 1):
+        if normalize_text(ws_prior.cell(row=row, column=2).value) == "Notes":
+            for notes_row in range(row + 1, ws_prior.max_row + 1):
+                value = ws_prior.cell(row=notes_row, column=2).value
+                if value not in (None, ""):
+                    notes_value = value
+                    break
+            break
+
+    if notes_value is not None:
+        notes_row = None
+        for row in range(1, ws_new.max_row + 1):
+            if normalize_text(ws_new.cell(row=row, column=2).value) == "Notes":
+                notes_row = row + 1
+                break
+        if notes_row:
+            set_cell_value(ws_new, notes_row, 2, notes_value)
             copied += 1
 
     return copied
@@ -1627,7 +3894,109 @@ def process_n_lead_turnover_analysis(ws_prior_values, ws_new):
     return copied
 
 
-def process_n_detail_sheet(ws_prior_formula, ws_prior_values, ws_new, bs_date, ws_prior_lead=None, ws_new_lead=None):
+def find_n_turnover_analysis_marker_row(ws, section_row):
+    """Find the actual N turnover-analysis wording marker, not the table title."""
+    for row in range(section_row + 1, min(section_row + 80, ws.max_row) + 1):
+        for col in range(1, min(6, ws.max_column) + 1):
+            text = normalize_text(ws.cell(row=row, column=col).value)
+            if text.startswith("分析"):
+                return row
+    return None
+
+
+def find_n_turnover_analysis_text_rows(ws, section_row):
+    """Find text rows below the N turnover analysis marker."""
+    marker_row = find_n_turnover_analysis_marker_row(ws, section_row)
+    if not marker_row:
+        return None, []
+
+    text_rows = []
+    blank_run = 0
+    for row in range(marker_row + 1, min(marker_row + 80, ws.max_row) + 1):
+        row_text = get_row_text(ws, row, 1, min(ws.max_column, 12))
+        normalized = normalize_text(row_text)
+
+        if row_has_any_keyword(ws, row, ("调整汇总", "调整分录", "异常项复核", "截止测试")):
+            break
+        if re.match(r"^表[0-9一二三四五六七八九十]+", normalized):
+            break
+
+        if not row_text:
+            blank_run += 1
+            if text_rows and blank_run >= 3:
+                break
+            continue
+
+        blank_run = 0
+        text_rows.append(row)
+
+    return marker_row, text_rows
+
+
+def find_n_turnover_analysis_target_end(ws, marker_row):
+    """Find the row before the next N turnover-analysis section."""
+    last_content_row = marker_row
+    blank_run = 0
+    for row in range(marker_row + 1, min(marker_row + 80, ws.max_row) + 1):
+        if row_has_any_keyword(ws, row, ("调整汇总", "调整分录", "异常项复核", "截止测试")):
+            return row - 1
+
+        row_text = get_row_text(ws, row, 1, min(ws.max_column, 12))
+        normalized = normalize_text(row_text)
+        if re.match(r"^表[0-9一二三四五六七八九十]+", normalized):
+            return row - 1
+
+        if row_text:
+            last_content_row = row
+            blank_run = 0
+        else:
+            blank_run += 1
+            if row > marker_row + 1 and blank_run >= 3:
+                return max(last_content_row, marker_row + 1)
+
+    return max(last_content_row, marker_row + 1)
+
+
+def process_n_lead_turnover_wording(ws_prior_values, ws_new):
+    """Roll N.00 turnover-analysis wording using dynamic section anchors."""
+    section_text = "表2 应付账款周转率分析"
+    prior_section_row = find_row_containing(ws_prior_values, section_text, (1, ws_prior_values.max_row))
+    new_section_row = find_row_containing(ws_new, section_text, (1, ws_new.max_row))
+    if not prior_section_row or not new_section_row:
+        return 0
+
+    _, source_rows = find_n_turnover_analysis_text_rows(ws_prior_values, prior_section_row)
+    target_marker_row, _ = find_n_turnover_analysis_text_rows(ws_new, new_section_row)
+    if not source_rows or not target_marker_row:
+        return 0
+
+    target_end_row = find_n_turnover_analysis_target_end(ws_new, target_marker_row)
+    available_rows = max(1, target_end_row - target_marker_row)
+    rows_to_insert = max(0, len(source_rows) - available_rows)
+    if rows_to_insert:
+        insert_at = target_end_row + 1
+        source_shape_row = max(target_marker_row + 1, target_end_row)
+        insert_rows_preserving_sheet_metadata(ws_new, insert_at, rows_to_insert)
+        for offset in range(rows_to_insert):
+            copy_row_shape(ws_new, source_shape_row, insert_at + offset, translate_formula=True)
+
+    copied = 0
+    max_col = min(ws_prior_values.max_column, ws_new.max_column, 12)
+    for offset, source_row in enumerate(source_rows):
+        target_row = target_marker_row + 1 + offset
+        for col in range(1, max_col + 1):
+            value = ws_prior_values.cell(row=source_row, column=col).value
+            if value in (None, ""):
+                set_cell_value(ws_new, target_row, col, None)
+                continue
+            if set_cell_value(ws_new, target_row, col, value):
+                highlight_wording_cell(ws_new, target_row, col)
+                copied += 1
+
+    return copied
+
+
+def process_n_detail_sheet(ws_prior_formula, ws_prior_values, ws_new, bs_date, ws_prior_lead=None, ws_new_lead=None, roll_forward_wording=False):
     """Copy N.01.01 detail sheet and roll prior closing values into the PY column."""
     clone_worksheet_contents(ws_prior_formula, ws_new)
 
@@ -1738,8 +4107,17 @@ def process_n_detail_sheet(ws_prior_formula, ws_prior_values, ws_new, bs_date, w
                     clear_border=True,
                 )
 
-        highlight_rows(ws_new, wording_rows, 2, min(ws_new.max_column, 8))
+        if roll_forward_wording:
+            for row in wording_rows:
+                for col in range(2, min(ws_new.max_column, 8) + 1):
+                    if ws_new.cell(row=row, column=col).value not in (None, ""):
+                        highlight_wording_cell(ws_new, row, col)
+        else:
+            for row in wording_rows:
+                for col in range(2, min(ws_new.max_column, 8) + 1):
+                    set_cell_value(ws_new, row, col, None)
 
+    tidy_n_detail_sheet_borders(ws_new, header_row, total_row)
     ws_new.sheet_view.showGridLines = False
 
     return copied
@@ -1762,7 +4140,10 @@ def generate_output_filename(template_name, bs_date, company_name):
 
 def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                            company_name, bs_date, output_dir, subject_config,
-                           cra_path=None, functional_currency=None, accounting_standard=None):
+                           cra_path=None, functional_currency=None, accounting_standard=None,
+                           pm_value=None, te_value=None,
+                           roll_forward_wording=False, generate_summary=True,
+                           progress_callback=None):
     """
     处理单个科目的Roll Forward
 
@@ -1780,13 +4161,17 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
     Returns:
         (success: bool, message: str, output_path: str, warnings: list)
     """
-    warnings_list = []
+    warnings_list = RollForwardWarnings()
 
     try:
         # 1. 提取公司信息
         company_info = extract_company_info_from_pmte(pmte_path, company_name)
         company_info["functional_currency"] = functional_currency
         company_info["accounting_standard"] = accounting_standard
+        if pm_value not in (None, ""):
+            company_info["PM"] = pm_value
+        if te_value not in (None, ""):
+            company_info["TE"] = te_value
 
         # 1.1 加载CRA等级表数据
         # 如果未指定CRA路径，尝试从PMTE同目录查找CRA文件
@@ -1813,15 +4198,26 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
         os.chmod(output_path, 0o666)
 
         # 4. 打开新底稿和上年底稿
-        # wb_prior_formula: 含公式，用于复制表头结构
-        # wb_prior_values: 含计算值，用于获取期末审定数
+        # 大文件用 openpyxl 加载很慢。只有 wording/L1/N 等需要公式或完整复制结构时，
+        # 才同时打开公式副本；普通 roll forward 只打开 data_only 工作簿。
+        needs_formula_workbook = roll_forward_wording or subject_code in {"L1", "N"}
+        if progress_callback:
+            size_mb = os.path.getsize(prior_path) / (1024 * 1024)
+            progress_callback(f"正在加载上年底稿: {os.path.basename(prior_path)} ({size_mb:.1f} MB)")
         wb_new = openpyxl.load_workbook(output_path)
-        wb_prior_formula = openpyxl.load_workbook(prior_path, data_only=False)
         wb_prior_values = openpyxl.load_workbook(prior_path, data_only=True)
+        wb_prior_formula = (
+            openpyxl.load_workbook(prior_path, data_only=False)
+            if needs_formula_workbook
+            else wb_prior_values
+        )
+        before_snapshot = workbook_snapshot(wb_new)
 
         try:
             lead_config = subject_config.get("lead_sheet", {})
             k01_config = subject_config.get("k01", {})
+            wording_copied_count = 0
+            wording_touched_sheets = set()
 
             if "汇总" in wb_new.sheetnames:
                 process_summary_sheet(wb_new["汇总"], company_info, bs_date, company_name, warnings_list)
@@ -1867,6 +4263,45 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                         wb_new[new_l103_sheet]
                     )
 
+            if subject_code == "K1":
+                prior_k033_sheet = next((s for s in wb_prior_values.sheetnames if "K.03.3" in s), None)
+                new_k033_sheet = next((s for s in wb_new.sheetnames if "K.03.3" in s), None)
+                if prior_k033_sheet and new_k033_sheet:
+                    process_k033_depreciation_policy(
+                        wb_prior_values[prior_k033_sheet],
+                        wb_new[new_k033_sheet]
+                    )
+
+            if subject_code == "L2":
+                prior_l2_bkd_sheet = next((s for s in wb_prior_values.sheetnames if "L2.01.1" in s), None)
+                new_l2_bkd_sheet = next((s for s in wb_new.sheetnames if "L2.01.1" in s), None)
+                if prior_l2_bkd_sheet and new_l2_bkd_sheet:
+                    process_l2_bkd(
+                        wb_prior_values[prior_l2_bkd_sheet],
+                        wb_new[new_l2_bkd_sheet]
+                    )
+
+            if subject_code == "Q1":
+                prior_q1_bkd_sheet = next((s for s in wb_prior_values.sheetnames if "Q1.01" in s), None)
+                new_q1_bkd_sheet = next((s for s in wb_new.sheetnames if "Q1.01" in s), None)
+                if prior_q1_bkd_sheet and new_q1_bkd_sheet:
+                    process_q1_bkd(
+                        wb_prior_values[prior_q1_bkd_sheet],
+                        wb_new[new_q1_bkd_sheet]
+                    )
+                if roll_forward_wording:
+                    prior_q1_covenant_sheet = next((s for s in wb_prior_formula.sheetnames if "Q1.05" in s), None)
+                    new_q1_covenant_sheet = next((s for s in wb_new.sheetnames if "Q1.05" in s), None)
+                    if prior_q1_covenant_sheet and new_q1_covenant_sheet:
+                        copied = process_q1_covenant_sheet(
+                            wb_prior_formula[prior_q1_covenant_sheet],
+                            wb_new[new_q1_covenant_sheet],
+                        )
+                        wording_copied_count += copied
+                        if copied:
+                            wording_touched_sheets.add(new_q1_covenant_sheet)
+                            warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+
             if subject_code == "N":
                 lead_sheet_name = lead_config.get("sheet_name", "")
                 if lead_sheet_name in wb_new.sheetnames and lead_sheet_name in wb_prior_values.sheetnames:
@@ -1874,6 +4309,14 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                         wb_prior_values[lead_sheet_name],
                         wb_new[lead_sheet_name]
                     )
+                    if roll_forward_wording:
+                        copied = process_n_lead_turnover_wording(
+                            wb_prior_values[lead_sheet_name],
+                            wb_new[lead_sheet_name],
+                        )
+                        wording_copied_count += copied
+                        if copied:
+                            wording_touched_sheets.add(lead_sheet_name)
 
                 detail_sheet_name = "N.01.01明细账"
                 if (
@@ -1889,7 +4332,8 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                         wb_new[detail_sheet_name],
                         bs_date,
                         ws_prior_lead,
-                        ws_new_lead
+                        ws_new_lead,
+                        roll_forward_wording=roll_forward_wording
                     )
 
             # 7. 处理子表（如U_exp的财务费用子表）
@@ -1899,6 +4343,13 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                 if sub_sheet_name and sub_sheet_name in wb_new.sheetnames and sub_sheet_name in wb_prior_values.sheetnames:
                     ws_new_sub = wb_new[sub_sheet_name]
                     ws_prior_sub = wb_prior_values[sub_sheet_name]
+
+                    if sub_sheet.get("dynamic_prior_current_to_py", False):
+                        _, total_row = process_expense_bkd_prior_current_to_py(ws_prior_sub, ws_new_sub)
+                        lead_sheet_name = lead_config.get("sheet_name", "")
+                        if lead_sheet_name in wb_new.sheetnames:
+                            update_lead_bkd_total_references(wb_new[lead_sheet_name], sub_sheet_name, total_row)
+                        continue
 
                     # 查找表头行
                     header_search_text = sub_sheet.get("header_search_text", "期末审定数")
@@ -1915,11 +4366,90 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                             if prior_cell.value is not None:
                                 new_cell.value = prior_cell.value
 
+            if subject_code == "UexpVCVD" and roll_forward_wording:
+                for bkd_sheet_name in ("VC.00 销售费用BKD", "VD.00 管理费用BKD"):
+                    if bkd_sheet_name in wb_prior_formula.sheetnames and bkd_sheet_name in wb_new.sheetnames:
+                        copied = process_vcvd_bkd_wording(
+                            wb_prior_formula[bkd_sheet_name],
+                            wb_new[bkd_sheet_name],
+                        )
+                        wording_copied_count += copied
+                        if copied:
+                            wording_touched_sheets.add(bkd_sheet_name)
+                            warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+
+                prior_cutoff_sheet = next((s for s in wb_prior_formula.sheetnames if "01.4" in s or "截止" in s), None)
+                new_cutoff_sheet = next((s for s in wb_new.sheetnames if "01.4" in s or "截止" in s), None)
+                if prior_cutoff_sheet and new_cutoff_sheet:
+                    copied = process_vcvd_cutoff_table2(
+                        wb_prior_formula[prior_cutoff_sheet],
+                        wb_new[new_cutoff_sheet],
+                    )
+                    wording_copied_count += copied
+                    if copied:
+                        wording_touched_sheets.add(new_cutoff_sheet)
+                        warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+
+            if subject_code == "Uexp" and roll_forward_wording:
+                lead_sheet_name = lead_config.get("sheet_name", "")
+                if lead_sheet_name in wb_prior_formula.sheetnames and lead_sheet_name in wb_new.sheetnames:
+                    copied = process_uexp_lead_wording(
+                        wb_prior_formula[lead_sheet_name],
+                        wb_new[lead_sheet_name],
+                    )
+                    wording_copied_count += copied
+                    if copied:
+                        wording_touched_sheets.add(lead_sheet_name)
+                        warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+
+                finance_bkd_sheet = next((s for s in wb_new.sheetnames if "BKD" in s and "财务" in s), None)
+                prior_finance_bkd_sheet = next((s for s in wb_prior_formula.sheetnames if "BKD" in s and "财务" in s), None)
+                if finance_bkd_sheet and prior_finance_bkd_sheet:
+                    copied = process_uexp_finance_bkd_wording(
+                        wb_prior_formula[prior_finance_bkd_sheet],
+                        wb_new[finance_bkd_sheet],
+                    )
+                    wording_copied_count += copied
+                    if copied:
+                        wording_touched_sheets.add(finance_bkd_sheet)
+                        warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
+
+            if roll_forward_wording:
+                copied, touched_sheets = process_wording_sections(
+                    wb_prior_formula,
+                    wb_prior_values,
+                    wb_new,
+                    subject_code,
+                    subject_config,
+                    warnings_list,
+                )
+                wording_copied_count += copied
+                wording_touched_sheets.update(touched_sheets)
+                if subject_code == "J1":
+                    copied = process_j1_wording_sections(
+                        wb_prior_formula,
+                        wb_prior_values,
+                        wb_new,
+                        warnings_list,
+                    )
+                    wording_copied_count += copied
+                    if copied:
+                        wording_touched_sheets.update(["J.00  Lead Sheet", "J.01 Agree SL to GL", "J.03"])
+                if subject_code == "L2":
+                    copied = process_l2_wording_sections(
+                        wb_prior_formula,
+                        wb_prior_values,
+                        wb_new,
+                        warnings_list,
+                    )
+                    wording_copied_count += copied
+                    if copied:
+                        wording_touched_sheets.update(["L2.00 Lead", "L2.02"])
+
             # 8. 保存
             wb_new.calculation.fullCalcOnLoad = True
             wb_new.calculation.forceFullCalc = True
             wb_new.calculation.calcMode = "auto"
-            wb_new.save(output_path)
 
             # 生成警告消息
             warning_msg = ""
@@ -1927,11 +4457,35 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                 warnings_list[:] = list(dict.fromkeys(warnings_list))
                 warning_msg = "; ".join(warnings_list)
 
+            if generate_summary:
+                add_roll_forward_summary_sheet(
+                    wb_new,
+                    subject_code,
+                    subject_config.get("name", ""),
+                    company_name,
+                    bs_date,
+                    prior_path,
+                    output_path,
+                    warnings_list,
+                    {
+                        "roll_wording": roll_forward_wording,
+                        "generate_summary": generate_summary,
+                    },
+                    wording_copied_count,
+                    sorted(wording_touched_sheets),
+                    before_snapshot,
+                )
+
+            if progress_callback:
+                progress_callback(f"正在保存输出文件: {os.path.basename(output_path)}")
+            wb_new.save(output_path)
+
             return True, f"处理成功{(' - ' + warning_msg if warning_msg else '')}", output_path, warnings_list
 
         finally:
             wb_new.close()
-            wb_prior_formula.close()
+            if wb_prior_formula is not wb_prior_values:
+                wb_prior_formula.close()
             wb_prior_values.close()
 
     except Exception as e:
@@ -1940,7 +4494,10 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
 
 def process_multiple_subjects(subject_codes, template_dir, prior_dir, pmte_path,
                               company_name, bs_date, output_dir, config_path=None,
-                              functional_currency=None, accounting_standard=None):
+                              functional_currency=None, accounting_standard=None,
+                              pm_value=None, te_value=None,
+                              roll_forward_wording=False, generate_summary=True,
+                              progress_callback=None):
     """
     批量处理多个科目
     """
@@ -1950,7 +4507,13 @@ def process_multiple_subjects(subject_codes, template_dir, prior_dir, pmte_path,
     # 计算上年日期
     prior_year = str(int(bs_date[:4]) - 1)
 
-    for subject_code in subject_codes:
+    total = len(subject_codes)
+    for index, subject_code in enumerate(subject_codes, start=1):
+        def emit(message):
+            if progress_callback:
+                progress_callback(index - 1, total, f"[{subject_code}] {message}")
+
+        emit("正在检查配置和模板")
         subject_config = config_manager.get_subject(subject_code)
         if not subject_config:
             results.append((subject_code, False, "找不到科目配置", None, []))
@@ -1964,20 +4527,32 @@ def process_multiple_subjects(subject_codes, template_dir, prior_dir, pmte_path,
             continue
 
         # 查找上年底稿
+        emit("正在查找上年底稿")
         prior_path = find_prior_file(prior_dir, subject_code, prior_year, subject_config)
         if not prior_path:
             results.append((subject_code, False, f"找不到上年底稿: {subject_code}", None, []))
             continue
+        prior_size = os.path.getsize(prior_path) / (1024 * 1024)
+        emit(f"已匹配上年底稿: {os.path.basename(prior_path)} ({prior_size:.1f} MB)")
 
         # 处理单个科目
+        emit("开始处理")
         success, message, output_path, warnings_list = process_single_subject(
             subject_code, template_path, prior_path, pmte_path,
             company_name, bs_date, output_dir, subject_config,
             functional_currency=functional_currency,
-            accounting_standard=accounting_standard
+            accounting_standard=accounting_standard,
+            pm_value=pm_value,
+            te_value=te_value,
+            roll_forward_wording=roll_forward_wording,
+            generate_summary=generate_summary,
+            progress_callback=lambda msg, code=subject_code: progress_callback(index - 1, total, f"[{code}] {msg}") if progress_callback else None,
         )
 
         results.append((subject_code, success, message, output_path, warnings_list))
+        if progress_callback:
+            status = "成功" if success else "失败"
+            progress_callback(index, total, f"[{status}] {subject_code}: {message}")
 
     return results
 

@@ -68,6 +68,7 @@
         "has_k01": true,
         "sheet_name": "K.01 Agree SL to GL",
         "header_row": 10,
+        "match_categories": true,
         "opening_balance_rows": [12],
         "categories": [
           {"name": "房屋建筑物", "audit_col": 7, "book_col": 5},
@@ -159,7 +160,8 @@
         "sheet_name": "Q1.00 Lead",
         "header_search_text": "期末审定数",
         "closing_col": 9,
-        "opening_col": 10
+        "opening_col": 10,
+        "clear_extra_template_rows": true
       },
       "k01": {
         "has_k01": false
@@ -174,14 +176,42 @@
         "sheet_name": "Uexp_Lead",
         "header_search_text": "期末审定数",
         "closing_col": 9,
-        "opening_col": 10
+        "opening_col": 10,
+        "match_existing_rows_only": true
       },
       "sub_sheets": [
         {
           "sheet_name": "Uexp财务费用BKD",
           "header_search_text": "本期期末审定数",
           "closing_col": 13,
-          "opening_col": 14
+          "opening_col": 14,
+          "dynamic_prior_current_to_py": true
+        }
+      ]
+    },
+    "UexpVCVD": {
+      "code": "UexpVCVD",
+      "name": "销售费用及管理费用",
+      "template_file": "U_exp SWP VC&VD 202YMMDD XYZ公司.xlsx",
+      "prior_file_pattern": "U_exp*VC&VD*{prior_year}*.xlsx",
+      "lead_sheet": {
+        "sheet_name": "Uexp.00 Lead",
+        "header_search_text": "本期审定数",
+        "closing_col": 8,
+        "opening_col": 9,
+        "match_existing_rows_only": true
+      },
+      "k01": {
+        "has_k01": false
+      },
+      "sub_sheets": [
+        {
+          "sheet_name": "VC.00 销售费用BKD",
+          "dynamic_prior_current_to_py": true
+        },
+        {
+          "sheet_name": "VD.00 管理费用BKD",
+          "dynamic_prior_current_to_py": true
         }
       ]
     }
