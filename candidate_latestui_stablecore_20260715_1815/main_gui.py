@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import datetime
+import multiprocessing
 import subprocess
 import tempfile
 import re
@@ -48,7 +49,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from roll_forward_core import SubjectConfig, process_multiple_subjects, resource_path
+from roll_forward_core import SubjectConfig, resource_path
+from roll_worker_process import run_rollforward_process
 from cra_support import (
     CRA_PARSER_VERSION,
     detect_cra_header_options,
@@ -3322,34 +3324,125 @@ class RollForwardWorker(QThread):
             return "terminate"
         return "continue"
 
+    def _request_for_subject(self, subject_code):
+        return {
+            "subject_code": subject_code,
+            "template_dir": self.template_dir,
+            "prior_dir": self.prior_dir,
+            "company_name": self.company_name,
+            "bs_date": self.bs_date,
+            "output_dir": self.output_dir,
+            "functional_currency": self.functional_currency,
+            "accounting_standard": self.accounting_standard,
+            "pm_value": self.pm_value,
+            "te_value": self.te_value,
+            "sad_value": self.sad_value,
+            "cra_records": self.cra_records,
+            "roll_forward_wording": self.roll_forward_wording,
+            "generate_summary": self.generate_summary,
+            "llm_enhanced": self.llm_enhanced,
+            "llm_wording_revision": self.llm_wording_revision,
+            "llm_options": self.llm_options,
+        }
+
+    def _wait_between_subjects(self, completed, total):
+        if self.pause_requested:
+            self.progress_signal.emit(completed, total, ">>> 已暂停，将从下一个科目继续")
+        while self.pause_requested and not self.stop_requested:
+            time.sleep(0.2)
+        if self.stop_requested:
+            self.was_terminated = True
+            self.progress_signal.emit(completed, total, ">>> 处理已终止，后续科目未执行")
+            return False
+        return True
+
+    def _run_isolated_subject(self, subject_code, completed, total):
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe(duplex=False)
+        process = context.Process(
+            target=run_rollforward_process,
+            args=(child_connection, self._request_for_subject(subject_code)),
+            name=f"RollForward-{subject_code}",
+        )
+        try:
+            process.start()
+        except Exception as exc:
+            parent_connection.close()
+            child_connection.close()
+            return [(subject_code, False, f"后台处理进程启动失败: {exc}", None, [])]
+        child_connection.close()
+
+        subject_results = None
+        fatal_error = None
+        started_at = time.monotonic()
+        next_heartbeat = started_at + 15.0
+        pipe_open = True
+
+        try:
+            while process.is_alive() or pipe_open:
+                has_event = False
+                if pipe_open:
+                    try:
+                        has_event = parent_connection.poll(0.2)
+                    except (EOFError, OSError):
+                        pipe_open = False
+
+                if has_event:
+                    try:
+                        event = parent_connection.recv()
+                    except (EOFError, OSError):
+                        pipe_open = False
+                        continue
+                    event_type = event[0]
+                    if event_type == "progress":
+                        child_current, _, message = event[1:]
+                        current = completed + (1 if child_current else 0)
+                        self.progress_signal.emit(current, total, message)
+                    elif event_type == "result":
+                        subject_results = event[1]
+                    elif event_type == "fatal":
+                        fatal_error = event[1]
+
+                if not process.is_alive() and not has_event:
+                    if not pipe_open:
+                        break
+                    try:
+                        if not parent_connection.poll():
+                            break
+                    except (EOFError, OSError):
+                        break
+
+                now = time.monotonic()
+                if process.is_alive() and now >= next_heartbeat:
+                    elapsed = int(now - started_at)
+                    self.progress_signal.emit(
+                        completed,
+                        total,
+                        f">>> [{subject_code}] 大文件处理中，已用时 {elapsed} 秒，请耐心等待",
+                    )
+                    next_heartbeat = now + 15.0
+        finally:
+            process.join()
+            parent_connection.close()
+
+        if subject_results:
+            return subject_results
+
+        if fatal_error:
+            detail = fatal_error.strip().splitlines()[-1]
+        else:
+            detail = f"后台处理进程异常退出（代码 {process.exitcode}）"
+        return [(subject_code, False, f"处理失败: {detail}", None, [])]
+
     def run(self):
         try:
-            def progress_callback(current, total, message):
-                self.progress_signal.emit(current, total, message)
-
-            results = process_multiple_subjects(
-                self.subject_codes,
-                self.template_dir,
-                self.prior_dir,
-                None,
-                self.company_name,
-                self.bs_date,
-                self.output_dir,
-                functional_currency=self.functional_currency,
-                accounting_standard=self.accounting_standard,
-                pm_value=self.pm_value,
-                te_value=self.te_value,
-                sad_value=self.sad_value,
-                cra_records=self.cra_records,
-                roll_forward_wording=self.roll_forward_wording,
-                generate_summary=self.generate_summary,
-                llm_enhanced=self.llm_enhanced,
-                llm_wording_revision=self.llm_wording_revision,
-                llm_options=self.llm_options,
-                progress_callback=progress_callback,
-                control_callback=self.control_callback,
-            )
-
+            results = []
+            total = len(self.subject_codes)
+            for subject_code in self.subject_codes:
+                completed = len(results)
+                if not self._wait_between_subjects(completed, total):
+                    break
+                results.extend(self._run_isolated_subject(subject_code, completed, total))
             self.finished_signal.emit(results)
         except Exception as exc:
             self.progress_signal.emit(0, 0, f"错误: {exc}")
@@ -3374,6 +3467,7 @@ class LLMConnectionTestWorker(QThread):
 
 
 def main():
+    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
     app.setWindowIcon(QIcon(resource_path(APP_ICON_PATH)))
