@@ -14,14 +14,20 @@ from cra_support import parse_cra_paste_text
 from roll_forward_core import (
     RollForwardWarnings,
     SubjectConfig,
+    find_c_bkd_structure,
     find_expense_bkd_header_row,
     find_expense_bkd_total_row,
     find_header_col,
     find_header_col_near,
     find_header_row,
+    find_l2_business_end_col,
+    find_label_cell,
     find_prior_file,
     find_q1_bkd_header_row,
     normalize_text,
+    process_c_bkd_basic_info,
+    process_c_cutoff_wording,
+    process_j1_cip_long_aging,
     process_lead_sheet,
 )
 
@@ -30,7 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = Path(__file__).resolve().parent
 TEMPLATES = ROOT / "templates"
 PRIOR_DIR = ROOT / "常规样本" / "吉安"
-OUTPUT_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "tmp_live_integrated_corefix3"
+OUTPUT_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "tmp_live_integrated_corefix5_final"
 
 FAILURES = []
 PASSES = []
@@ -225,6 +231,212 @@ def check_q1(path):
     check(sorted(drawing_rows) == [34, 34, 42, 42, 42, 64, 64], "Q1: copied images follow rebuilt Note blocks")
 
 
+def first_body_value(ws, anchor_row, max_rows=8, col_start=1, col_end=30):
+    for row in range(anchor_row + 1, min(ws.max_row, anchor_row + max_rows) + 1):
+        for col in range(col_start, min(ws.max_column, col_end) + 1):
+            value = ws.cell(row, col).value
+            if value not in (None, "") and not (isinstance(value, str) and value.startswith("=")):
+                return row, col, value
+    return None, None, None
+
+
+def nearest_adjacent_value(ws, row, label_col):
+    for distance in range(1, min(ws.max_column, 12) + 1):
+        for col in (label_col - distance, label_col + distance):
+            if col < 1 or col > ws.max_column:
+                continue
+            value = ws.cell(row, col).value
+            if value not in (None, "") and not (isinstance(value, str) and value.startswith("=")):
+                return row, col, value
+    return None, None, None
+
+
+def c_bkd_records(ws):
+    header, columns, marker = find_c_bkd_structure(ws)
+    records = []
+    for row in range(header + 1, marker):
+        record = tuple(ws.cell(row, columns[field]).value for field in columns)
+        if any(value not in (None, "") for value in record):
+            records.append((row, record))
+    return columns, records
+
+
+def check_c_roll(path):
+    prior_path = PRIOR_DIR / "C SWP 货币资金 20251231 吉安三强.xlsx"
+    prior = load_workbook(prior_path, data_only=False)
+    prior_values = load_workbook(prior_path, data_only=True)
+    output = load_workbook(path, data_only=False)
+    template = load_workbook(TEMPLATES / "C SWP 货币资金 202YMMDD XYZ公司.xlsx", data_only=False)
+
+    source_cols, source_records = c_bkd_records(prior_values["C.00 BKD"])
+    target_cols, target_records = c_bkd_records(output["C.00 BKD"])
+    check(
+        [record for _, record in source_records] == [record for _, record in target_records],
+        "C.00 BKD: all six account identity fields roll for every real account row",
+    )
+    check(len(target_records) == 14, "C.00 BKD: template expands to all 14 Ji'an account rows")
+    check(
+        all(
+            not is_roll_highlight(output["C.00 BKD"].cell(row, target_cols[field]))
+            for row, _ in target_records
+            for field in target_cols
+        ),
+        "C.00 BKD: always-rolled identity fields are not wording-highlighted",
+    )
+
+    prior_cutoff = prior["C.03 Cutoff"]
+    output_cutoff = output["C.03 Cutoff"]
+    source_period_label = find_label_cell(prior_cutoff, ("使用的截止期间",))
+    target_period_label = find_label_cell(output_cutoff, ("使用的截止期间",))
+    source_period = nearest_adjacent_value(prior_cutoff, *source_period_label)
+    target_period = nearest_adjacent_value(output_cutoff, *target_period_label)
+    check(source_period[2] == target_period[2], "C.03 Cutoff: labeled cutoff period rolls dynamically")
+    check(is_roll_highlight(output_cutoff.cell(target_period[0], target_period[1])), "C.03 Cutoff: cutoff period is highlighted")
+
+    source_reason_label = find_label_cell(prior_cutoff, ("所使用截止期间的理由",))
+    target_reason_label = find_label_cell(output_cutoff, ("所使用截止期间的理由",))
+    source_reason = first_body_value(prior_cutoff, source_reason_label[0])
+    target_reason = first_body_value(output_cutoff, target_reason_label[0])
+    check(source_reason[2] == target_reason[2], "C.03 Cutoff: labeled rationale rolls dynamically")
+    check(is_roll_highlight(output_cutoff.cell(target_reason[0], target_reason[1])), "C.03 Cutoff: rationale is highlighted")
+
+    fixture = template
+    process_c_bkd_basic_info(prior_values["C.00 BKD"], fixture["C.00 BKD"])
+    fixture_period_label = find_label_cell(fixture["C.03 Cutoff"], ("使用的截止期间",))
+    fixture_period = nearest_adjacent_value(fixture["C.03 Cutoff"], *fixture_period_label)
+    check(fixture_period[2] is None, "C fixture: BKD identity roll is independent of wording")
+    process_c_cutoff_wording(prior["C.03 Cutoff"], prior_values["C.03 Cutoff"], fixture["C.03 Cutoff"])
+    fixture_period = nearest_adjacent_value(fixture["C.03 Cutoff"], *fixture_period_label)
+    check(fixture_period[2] == source_period[2], "C fixture: Cutoff wording rolls only when its wording step runs")
+
+    prior.close()
+    prior_values.close()
+    output.close()
+    template.close()
+
+
+def check_j1_wording(path):
+    prior_path = PRIOR_DIR / "J1 SWP 在建工程 20251231吉安.xlsx"
+    prior = load_workbook(prior_path, data_only=False)
+    prior_values = load_workbook(prior_path, data_only=True)
+    output = load_workbook(path, data_only=False)
+    template = load_workbook(TEMPLATES / "J1 SWP 在建工程 202YMMDD XYZ公司.xlsx", data_only=False)
+    prior_ws = prior["J.03 CIP长期挂账"]
+    prior_values_ws = prior_values["J.03 CIP长期挂账"]
+    output_ws = output["J.03 CIP长期挂账"]
+    template_ws = template["J.03 CIP长期挂账"]
+
+    source_reason_anchor = find_label_cell(prior_ws, ("选择待测试项目的理由",))[0]
+    target_reason_anchor = find_label_cell(output_ws, ("选择待测试项目的理由",))[0]
+    source_reason = first_body_value(prior_ws, source_reason_anchor)
+    target_reason = first_body_value(output_ws, target_reason_anchor)
+    check(source_reason[2] == target_reason[2], "J.03: selection rationale rolls by its prompt")
+    check(is_roll_highlight(output_ws.cell(target_reason[0], target_reason[1])), "J.03: selection rationale is highlighted")
+
+    note_anchor = find_label_cell(prior_ws, ("标记图例",))[0]
+    fixture_text = "Fixture J.03 Note"
+    prior_ws.cell(note_anchor + 1, 2).value = fixture_text
+    prior_values_ws.cell(note_anchor + 1, 2).value = fixture_text
+    process_j1_cip_long_aging(prior_ws, prior_values_ws, template_ws)
+    target_note_anchor = find_label_cell(template_ws, ("标记图例",))[0]
+    target_note = first_body_value(template_ws, target_note_anchor)
+    check(target_note[2] == fixture_text, "J.03 fixture: populated Note rolls by prompt")
+    check(is_roll_highlight(template_ws.cell(target_note[0], target_note[1])), "J.03 fixture: populated Note is highlighted")
+
+    prior.close()
+    prior_values.close()
+    output.close()
+    template.close()
+
+
+def l2_note_values(ws):
+    values = []
+    for row in range(1, ws.max_row + 1):
+        if normalize_text(ws.cell(row, 2).value).lower().startswith("notes"):
+            values.append(first_body_value(ws, row, max_rows=4, col_start=3, col_end=8))
+    return values
+
+
+def check_l2_full_width_and_wording(path):
+    prior = load_workbook(PRIOR_DIR / "L2 SWP 长期待摊费用 20251231吉安.xlsx", data_only=False)
+    output = load_workbook(path, data_only=False)
+    ws = output["L2.01.1 BKD"]
+    header = find_header_row(ws, "项目编码", (1, 80))
+    total = next(
+        row
+        for row in range(header + 1, ws.max_row + 1)
+        if any(normalize_text(ws.cell(row, col).value) == "合计" for col in range(1, 10))
+    )
+    business_end = find_l2_business_end_col(ws, header)
+    check(business_end == 39, "L2.01.1: real business boundary reaches AM and excludes trailing plug-in columns")
+    check(total - header - 1 == 14, "L2.01.1: all 14 Ji'an detail rows fit before total")
+
+    formula_cols = (20, 26, 27, 28, 30, 31, 32, 34, 36, 37, 38)
+    check(
+        all(
+            isinstance(ws.cell(row, col).value, str) and ws.cell(row, col).value.startswith("=")
+            for row in range(header + 1, total)
+            for col in formula_cols
+        ),
+        "L2.01.1: every expanded row keeps formulas through the downstream business sections",
+    )
+    check(
+        all(getattr(ws.cell(row, 35).value, "ref", None) == f"AI{row}" for row in range(header + 1, total)),
+        "L2.01.1: every expanded row has a valid row-local AI array formula",
+    )
+    check(
+        all(ws.cell(header + 1, col).style_id == ws.cell(total - 1, col).style_id for col in range(19, business_end + 1)),
+        "L2.01.1: downstream styles extend through the last detail row",
+    )
+    check(
+        any(
+            any(cell_range.min_col <= 33 <= cell_range.max_col and cell_range.min_row <= header + 1 and cell_range.max_row >= total - 1 for cell_range in validation.sqref.ranges)
+            for validation in ws.data_validations.dataValidation
+        ),
+        "L2.01.1: AG sample-type validation covers every expanded row",
+    )
+    check(
+        ws.cell(total, 19).value == f"=SUM(S{header + 1}:S{total - 1})"
+        and ws.cell(total, 30).value == f"=SUM(AD{header + 1}:AD{total - 1})"
+        and ws.cell(total, 36).value == f"=SUM(AJ{header + 1}:AJ{total - 1})",
+        "L2.01.1: downstream total formulas use the full expanded detail range",
+    )
+    downstream_formula = next(
+        ws.cell(row, 7).value
+        for row in range(total + 1, ws.max_row + 1)
+        if isinstance(ws.cell(row, 7).value, str) and ws.cell(row, 7).value.startswith("=SUM(")
+    )
+    check(f"-P{total}" in downstream_formula, "L2.01.1: table 2 reconciliation formula follows the moved table total")
+
+    prior_notes = l2_note_values(prior["L2.01.1 BKD"])
+    output_notes = l2_note_values(ws)
+    check(
+        len(prior_notes) == len(output_notes) == 3
+        and [item[2] for item in prior_notes] == [item[2] for item in output_notes],
+        "L2.01.1: all three real Notes roll to their corresponding boxes",
+    )
+    check(
+        all(is_roll_highlight(ws.cell(row, col)) for row, col, value in output_notes if value not in (None, "")),
+        "L2.01.1: every rolled Note response is highlighted",
+    )
+
+    prior_lead = prior["L2.00 Lead"]
+    output_lead = output["L2.00 Lead"]
+    prior_adjustment = find_label_cell(prior_lead, ("调整汇总表",))[0]
+    output_adjustment = find_label_cell(output_lead, ("调整汇总表",))[0]
+    prior_value = first_body_value(prior_lead, prior_adjustment)
+    output_value = first_body_value(output_lead, output_adjustment)
+    check(prior_value[2] == output_value[2], "L2.00 Lead: populated adjustment summary rolls when wording is enabled")
+    check(is_roll_highlight(output_lead.cell(output_value[0], output_value[1])), "L2.00 Lead: adjustment content is highlighted")
+    check(
+        all(not is_roll_highlight(output_lead.cell(output_adjustment, col)) for col in range(1, 12)),
+        "L2.00 Lead: fixed adjustment-summary labels are not highlighted",
+    )
+
+    prior.close()
+    output.close()
+
+
 def thin_outer_border(ws, cell_range):
     cells = ws[cell_range]
     return (
@@ -269,6 +481,7 @@ def check_l2_expansion_fixture():
             ws.cell(row, 4, f"Fixture item {offset + 3}")
             ws.cell(row, closing_col, 1000 + offset)
     config = SubjectConfig(SOURCE / "subjects_config.json").get_subject("L2")["lead_sheet"]
+    lead_warnings = RollForwardWarnings()
     process_lead_sheet(
         prior_formula["L2.00 Lead"],
         output_wb["L2.00 Lead"],
@@ -277,7 +490,7 @@ def check_l2_expansion_fixture():
         "2026-06-30",
         "Fixture company",
         config,
-        RollForwardWarnings(),
+        lead_warnings,
     )
     ws = output_wb["L2.00 Lead"]
     header = find_header_row(ws, "期末审定数", (1, 80))
@@ -296,6 +509,10 @@ def check_l2_expansion_fixture():
     check(ws.cell(total, 7).value == f"=SUM(G{detail_start}:G{detail_end})", "L2 fixture: total formula uses expanded detail range")
     below_text = [normalize_text(ws.cell(row, col).value) for row in range(total + 1, min(total + 12, ws.max_row) + 1) for col in range(1, 14)]
     check("Rx" in below_text and "A3" in below_text and "Diff" in below_text, "L2 fixture: Rx/A3/Diff area moves below total")
+    check(
+        not any("未找到Level数据" in warning or "未找到RP数据" in warning for warning in lead_warnings),
+        "Warnings: optional PMTE Level/RP absence is silent",
+    )
     prior_formula.close()
     prior_values.close()
     output_wb.close()
@@ -314,15 +531,16 @@ def check_repair_roots(l2_path, vcvd_path):
         for row in range(header + 1, ws.max_row + 1)
         if any(normalize_text(ws.cell(row, col).value) == "合计" for col in range(1, 8))
     )
-    hidden_formula_rows = [
+    business_end = find_l2_business_end_col(ws, header)
+    plug_in_formula_rows = [
         row
-        for row in range(28, total)
+        for row in range(header + 1, total)
         if any(
             isinstance(ws.cell(row, col).value, str) and ws.cell(row, col).value.startswith("=")
-            for col in range(19, ws.max_column + 1)
+            for col in range(business_end + 1, ws.max_column + 1)
         )
     ]
-    check(not hidden_formula_rows, "L2.01.1: expanded records do not clone hidden plug-in formulas")
+    check(not plug_in_formula_rows, "L2.01.1: expanded records stop before trailing plug-in columns")
     check(ws.cell(total, 7).value == f"=SUM(G{header + 1}:G{total - 1})", "L2.01.1: total starts at first detail row")
     wb.close()
 
@@ -351,19 +569,24 @@ def main():
     check(matched_vcvd and "VC&VD" in Path(matched_vcvd).name, "VCVD matcher selects the VC&VD prior workbook")
     check(matched_uexp and "财务费用" in Path(matched_uexp).name, "Uexp matcher selects the finance expense prior workbook")
 
+    c = workbook_path("C SWP")
+    j1 = workbook_path("J1 SWP")
     q1 = workbook_path("Q1 SWP")
     vcvd = workbook_path("U_exp SWP VC&VD")
     l2 = workbook_path("L2 SWP")
     uexp = workbook_path("U_exp SWP other")
-    for path in (q1, vcvd, l2, uexp):
+    for path in (c, j1, q1, vcvd, l2, uexp):
         check_xlsx_package(path)
 
+    check_c_roll(c)
+    check_j1_wording(j1)
     check_q1(q1)
     check_expense_roll(Path(matched_vcvd), vcvd, "VC.00")
     check_expense_roll(Path(matched_vcvd), vcvd, "VD.00")
     check_expense_roll(Path(matched_uexp), uexp, "Uexp财务费用BKD")
     check_uexp(uexp)
     check_l2_expansion_fixture()
+    check_l2_full_width_and_wording(l2)
     check_repair_roots(l2, vcvd)
     check_cra_applicable_variants()
 

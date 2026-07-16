@@ -28,6 +28,7 @@ from openpyxl.formula.translate import Translator
 from openpyxl.formatting.formatting import ConditionalFormatting
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
+from openpyxl.worksheet.formula import ArrayFormula
 
 # 忽略openpyxl的警告
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -301,7 +302,19 @@ def copy_cell_shape(source_cell, target_cell, translate_formula=False):
         target_cell.protection = copy(source_cell.protection)
 
     value = source_cell.value
-    if translate_formula and isinstance(value, str) and value.startswith("="):
+    if translate_formula and isinstance(value, ArrayFormula):
+        formula_text = value.text
+        try:
+            formula_text = Translator(
+                formula_text,
+                origin=source_cell.coordinate,
+            ).translate_formula(target_cell.coordinate)
+        except Exception:
+            pass
+        value = ArrayFormula(ref=target_cell.coordinate, text=formula_text)
+    elif isinstance(value, ArrayFormula):
+        value = ArrayFormula(ref=target_cell.coordinate, text=value.text)
+    elif translate_formula and isinstance(value, str) and value.startswith("="):
         try:
             value = Translator(value, origin=source_cell.coordinate).translate_formula(target_cell.coordinate)
         except Exception:
@@ -1029,6 +1042,7 @@ def process_wording_sections(wb_prior_formula, wb_prior_values, wb_new, subject_
             continue
         if subject_code == "L2" and (
             normalize_text(sheet_name).startswith("L2.00")
+            or normalize_text(sheet_name).startswith("L2.01.1")
             or normalize_text(sheet_name).startswith("L2.02")
         ):
             continue
@@ -1115,6 +1129,244 @@ def clear_target_cells(ws_target, row_start, row_end, col_start, col_end):
             set_cell_value(ws_target, row, col, None)
 
 
+def find_label_cell(ws, keywords, search_range=None, max_col=30):
+    """Find a label cell by its visible text instead of a fixed coordinate."""
+    start_row, end_row = search_range or (1, ws.max_row)
+    for row in range(max(1, start_row), min(ws.max_row, end_row) + 1):
+        for col in range(1, min(ws.max_column, max_col) + 1):
+            value = ws.cell(row=row, column=col).value
+            if value in (None, ""):
+                continue
+            if text_has_any_keyword(value, keywords):
+                return row, col
+    return None, None
+
+
+def rollable_cell_value(formula_cell, value_cell):
+    """Return a prior-year constant or cached formula result for a labeled field."""
+    formula_value = formula_cell.value
+    cached_value = value_cell.value
+    if isinstance(formula_value, str) and formula_value.startswith("="):
+        return cached_value
+    if formula_value not in (None, ""):
+        return formula_value
+    return cached_value
+
+
+def copy_adjacent_labeled_value(ws_prior_formula, ws_prior_values, ws_new, label_keywords):
+    """Copy the nearest value beside a matching label and mark it for review."""
+    source_row, source_label_col = find_label_cell(ws_prior_formula, label_keywords)
+    target_row, target_label_col = find_label_cell(ws_new, label_keywords)
+    if not source_row or not target_row:
+        return 0
+
+    source_col = None
+    value = None
+    for distance in range(1, min(ws_prior_formula.max_column, 12) + 1):
+        for candidate_col in (source_label_col - distance, source_label_col + distance):
+            if candidate_col < 1 or candidate_col > ws_prior_formula.max_column:
+                continue
+            candidate = rollable_cell_value(
+                ws_prior_formula.cell(source_row, candidate_col),
+                ws_prior_values.cell(source_row, candidate_col),
+            )
+            if candidate in (None, ""):
+                continue
+            source_col = candidate_col
+            value = candidate
+            break
+        if source_col:
+            break
+    if source_col is None:
+        return 0
+
+    relative_col = source_col - source_label_col
+    target_col = target_label_col + relative_col
+    if target_col < 1 or target_col > ws_new.max_column or isinstance(ws_new.cell(target_row, target_col), MergedCell):
+        target_col = None
+        for distance in range(1, min(ws_new.max_column, 12) + 1):
+            for candidate_col in (target_label_col - distance, target_label_col + distance):
+                if candidate_col < 1 or candidate_col > ws_new.max_column:
+                    continue
+                if not isinstance(ws_new.cell(target_row, candidate_col), MergedCell):
+                    target_col = candidate_col
+                    break
+            if target_col:
+                break
+    if not target_col or not set_cell_value(ws_new, target_row, target_col, value):
+        return 0
+    highlight_wording_cell(ws_new, target_row, target_col)
+    return 1
+
+
+def copy_following_labeled_text(ws_prior_formula, ws_prior_values, ws_new, label_keywords, max_rows=8):
+    """Copy the first populated response below a matching prompt."""
+    source_anchor, _ = find_label_cell(ws_prior_formula, label_keywords)
+    target_anchor, _ = find_label_cell(ws_new, label_keywords)
+    if not source_anchor or not target_anchor:
+        return 0
+
+    source_row = source_col = None
+    value = None
+    for row in range(source_anchor + 1, min(ws_prior_formula.max_row, source_anchor + max_rows) + 1):
+        for col in range(1, min(ws_prior_formula.max_column, 30) + 1):
+            candidate = rollable_cell_value(
+                ws_prior_formula.cell(row, col),
+                ws_prior_values.cell(row, col),
+            )
+            if candidate in (None, ""):
+                continue
+            if isinstance(candidate, str) and candidate.startswith("="):
+                continue
+            source_row, source_col, value = row, col, candidate
+            break
+        if source_row:
+            break
+    if not source_row:
+        return 0
+
+    target_row = target_anchor + 1
+    target_col = source_col
+    if target_row > ws_new.max_row:
+        return 0
+    if target_col > ws_new.max_column or isinstance(ws_new.cell(target_row, target_col), MergedCell):
+        target_col = next(
+            (
+                col for col in range(1, min(ws_new.max_column, 30) + 1)
+                if not isinstance(ws_new.cell(target_row, col), MergedCell)
+            ),
+            None,
+        )
+    if not target_col or not set_cell_value(ws_new, target_row, target_col, value):
+        return 0
+    highlight_wording_cell(ws_new, target_row, target_col)
+    return 1
+
+
+def find_c_bkd_structure(ws):
+    """Locate the C.00 BKD detail header, mapped base columns, and detail boundary."""
+    field_keywords = OrderedDict([
+        ("company", ("公司名称",)),
+        ("subject", ("科目名称",)),
+        ("bank", ("银行/存款机构名称", "存款机构名称")),
+        ("account", ("账号",)),
+        ("currency", ("币种",)),
+        ("purpose", ("货币资金账户的性质和用途", "账户的性质和用途")),
+    ])
+    for row in range(1, min(ws.max_row, 80) + 1):
+        columns = {}
+        for field, keywords in field_keywords.items():
+            col = find_header_col(ws, row, keywords, max_col=min(ws.max_column, 30))
+            if col:
+                columns[field] = col
+        if len(columns) != len(field_keywords):
+            continue
+        marker_row = next(
+            (
+                candidate for candidate in range(row + 1, ws.max_row + 1)
+                if row_has_any_keyword(
+                    ws,
+                    candidate,
+                    ("本表格包括所有的货币资金信息", "本表格包括所有货币资金信息"),
+                    1,
+                    min(ws.max_column, 30),
+                )
+            ),
+            None,
+        )
+        if marker_row:
+            return row, columns, marker_row
+    return None, {}, None
+
+
+def process_c_bkd_basic_info(ws_prior_values, ws_new):
+    """Always roll the six C.00 BKD account identity fields from the prior workbook."""
+    source_header, source_cols, source_marker = find_c_bkd_structure(ws_prior_values)
+    target_header, target_cols, target_marker = find_c_bkd_structure(ws_new)
+    if not source_header or not target_header or not source_marker or not target_marker:
+        return 0
+
+    records = []
+    for row in range(source_header + 1, source_marker):
+        record = {field: ws_prior_values.cell(row, col).value for field, col in source_cols.items()}
+        if any(value not in (None, "") for value in record.values()):
+            records.append(record)
+    if not records:
+        return 0
+
+    data_start = target_header + 1
+    available_rows = target_marker - data_start
+    extra_rows = max(0, len(records) - available_rows)
+    old_detail_end = target_marker - 1
+    if extra_rows:
+        shape_row = data_start
+        insert_rows_preserving_sheet_metadata(ws_new, target_marker, extra_rows)
+        for offset in range(extra_rows):
+            copy_row_shape(ws_new, shape_row, target_marker + offset, translate_formula=True)
+        target_marker += extra_rows
+
+    copied = 0
+    for index, record in enumerate(records):
+        target_row = data_start + index
+        if target_row > old_detail_end:
+            copy_row_shape(ws_new, data_start, target_row, translate_formula=True)
+        for field, value in record.items():
+            if set_cell_value(ws_new, target_row, target_cols[field], value):
+                copied += 1
+
+    for row in range(data_start + len(records), target_marker):
+        for col in target_cols.values():
+            set_cell_value(ws_new, row, col, None)
+
+    last_record_row = data_start + len(records) - 1
+    total_row = next(
+        (
+            row for row in range(target_marker + 1, min(ws_new.max_row, target_marker + 8) + 1)
+            if any(
+                isinstance(ws_new.cell(row, col).value, str)
+                and ws_new.cell(row, col).value.upper().startswith("=SUM(")
+                for col in range(1, min(ws_new.max_column, 30) + 1)
+            )
+        ),
+        None,
+    )
+    if total_row:
+        for col in range(1, min(ws_new.max_column, 30) + 1):
+            formula = ws_new.cell(total_row, col).value
+            if isinstance(formula, str) and formula.upper().startswith("=SUM("):
+                letter = get_column_letter(col)
+                set_cell_value(ws_new, total_row, col, f"=SUM({letter}{data_start}:{letter}{last_record_row})")
+        for row in range(total_row + 1, min(ws_new.max_row, total_row + 5) + 1):
+            if not row_has_any_keyword(ws_new, row, ("C_Lead",), 1, min(ws_new.max_column, 30)):
+                continue
+            for col in range(1, min(ws_new.max_column, 30) + 1):
+                formula = ws_new.cell(row, col).value
+                if not isinstance(formula, str) or not formula.startswith("="):
+                    continue
+                letter = get_column_letter(col)
+                updated = re.sub(rf"(?<![A-Za-z0-9_!']){letter}\d+", f"{letter}{total_row}", formula, count=1)
+                set_cell_value(ws_new, row, col, updated)
+
+    return copied
+
+
+def process_c_cutoff_wording(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll the labeled C.03 cutoff period and its rationale when wording is enabled."""
+    copied = copy_adjacent_labeled_value(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        ("使用的截止期间",),
+    )
+    copied += copy_following_labeled_text(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        ("描述所使用截止期间的理由", "所使用截止期间的理由"),
+    )
+    return copied
+
+
 def process_j1_lead_wording(ws_prior_formula, ws_prior_values, ws_new):
     """Roll J.00 Lead wording sections into their fixed template areas."""
     copied = 0
@@ -1184,10 +1436,24 @@ def process_j1_agree_notes(ws_prior_formula, ws_prior_values, ws_new):
 
 def process_j1_cip_long_aging(ws_prior_formula, ws_prior_values, ws_new):
     """Roll populated J.03 CIP long-aging test rows when prior year has content."""
+    copied = 0
+    copied += copy_following_labeled_text(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        ("选择待测试项目的理由", "选取待测试项目的理由"),
+    )
+    copied += copy_following_labeled_text(
+        ws_prior_formula,
+        ws_prior_values,
+        ws_new,
+        ("标记图例", "记录已识别的异常情况"),
+    )
+
     header_row = find_header_row(ws_prior_formula, "样本序号", (1, 40))
     target_header_row = find_header_row(ws_new, "样本序号", (1, 40))
     if not header_row or not target_header_row:
-        return 0
+        return copied
 
     prior_records = []
     for row in range(header_row + 1, ws_prior_formula.max_row + 1):
@@ -1197,7 +1463,7 @@ def process_j1_cip_long_aging(ws_prior_formula, ws_prior_values, ws_new):
             prior_records.append(row)
 
     if not prior_records:
-        return 0
+        return copied
 
     marker_row = find_row_containing(ws_new, "标记图例", (target_header_row + 1, ws_new.max_row))
     if not marker_row:
@@ -1209,7 +1475,6 @@ def process_j1_cip_long_aging(ws_prior_formula, ws_prior_values, ws_new):
         for offset in range(extra_rows):
             copy_row_shape(ws_new, marker_row - 1, marker_row + offset, translate_formula=True)
 
-    copied = 0
     for idx, source_row in enumerate(prior_records):
         target_row = target_header_row + 1 + idx
         for col in range(2, min(ws_prior_formula.max_column, 9) + 1):
@@ -1358,23 +1623,183 @@ def process_l2_lead_notes(ws_prior_formula, ws_prior_values, ws_new):
     )
 
 
+def process_l2_lead_adjustment_summary(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll a populated L2 Lead adjustment summary into the current template section."""
+    source_start = find_row_containing(ws_prior_formula, "调整汇总表", (1, ws_prior_formula.max_row))
+    target_start = find_row_containing(ws_new, "调整汇总表", (1, ws_new.max_row))
+    if not source_start or not target_start:
+        return 0
+    source_end = find_wording_section_end(ws_prior_formula, source_start, max_rows=20)
+    if source_end <= source_start:
+        return 0
+
+    target_end = find_wording_section_end(ws_new, target_start, max_rows=20)
+    source_data_len = source_end - source_start
+    target_data_len = max(1, target_end - target_start)
+    ensure_target_wording_capacity(
+        ws_new,
+        target_start + 1,
+        target_data_len,
+        source_data_len,
+    )
+
+    copied = 0
+    for offset, source_row in enumerate(range(source_start + 1, source_end + 1)):
+        target_row = target_start + 1 + offset
+        for col in range(1, min(ws_prior_formula.max_column, ws_new.max_column, 40) + 1):
+            value = source_wording_value(
+                ws_prior_formula.cell(source_row, col),
+                ws_prior_values.cell(source_row, col),
+                table_like=True,
+            )
+            if value in (None, ""):
+                continue
+            if set_cell_value(ws_new, target_row, col, value):
+                highlight_wording_cell(ws_new, target_row, col)
+                copied += 1
+    return copied
+
+
+def find_l2_note_anchors(ws):
+    """Return each actual L2 Notes prompt in worksheet order."""
+    anchors = []
+    for row in range(1, ws.max_row + 1):
+        for col in range(1, min(ws.max_column, 12) + 1):
+            value = normalize_text(ws.cell(row=row, column=col).value)
+            if value.lower().startswith("notes"):
+                anchors.append((row, col))
+                break
+    return anchors
+
+
+def l2_note_body_bounds(ws, anchor_row, anchor_col):
+    """Locate the formatted response box immediately below an L2 Notes prompt."""
+    candidates = [
+        merged_range
+        for merged_range in ws.merged_cells.ranges
+        if anchor_row < merged_range.min_row <= anchor_row + 4
+        and merged_range.max_col > merged_range.min_col
+    ]
+    if candidates:
+        merged_range = min(candidates, key=lambda item: (item.min_row, item.min_col))
+        return merged_range.min_row, merged_range.max_row, merged_range.min_col, merged_range.max_col
+    body_row = anchor_row + 1
+    body_col = min(ws.max_column, anchor_col + 1)
+    return body_row, min(ws.max_row, body_row + 2), body_col, min(ws.max_column, body_col + 4)
+
+
+def duplicate_bounded_row_block(ws, source_start, source_end, insert_at, col_end=40):
+    """Clone a formatted row block without copying trailing worksheet plug-in columns."""
+    block_length = source_end - source_start + 1
+    source_merges = [
+        deepcopy(merged_range)
+        for merged_range in ws.merged_cells.ranges
+        if merged_range.min_row >= source_start
+        and merged_range.max_row <= source_end
+        and merged_range.max_col <= col_end
+    ]
+    insert_rows_preserving_sheet_metadata(ws, insert_at, block_length)
+    for offset in range(block_length):
+        source_row = source_start + offset
+        target_row = insert_at + offset
+        for col in range(1, min(ws.max_column, col_end) + 1):
+            copy_cell_shape(
+                ws.cell(source_row, col),
+                ws.cell(target_row, col),
+                translate_formula=True,
+            )
+        ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+    row_shift = insert_at - source_start
+    for merged_range in source_merges:
+        ws.merge_cells(
+            start_row=merged_range.min_row + row_shift,
+            start_column=merged_range.min_col,
+            end_row=merged_range.max_row + row_shift,
+            end_column=merged_range.max_col,
+        )
+    return insert_at, insert_at + block_length - 1
+
+
+def process_l2_bkd_notes(ws_prior_formula, ws_prior_values, ws_new):
+    """Roll every L2 BKD Notes response by occurrence, cloning a template box if needed."""
+    source_anchors = find_l2_note_anchors(ws_prior_formula)
+    target_anchors = find_l2_note_anchors(ws_new)
+    if not source_anchors or not target_anchors:
+        return 0
+
+    while len(target_anchors) < len(source_anchors):
+        template_row, template_col = target_anchors[-1]
+        _, body_end, _, _ = l2_note_body_bounds(ws_new, template_row, template_col)
+        new_start, _ = duplicate_bounded_row_block(
+            ws_new,
+            template_row,
+            body_end,
+            body_end + 1,
+        )
+        target_anchors.append((new_start, template_col))
+
+    copied = 0
+    for (source_row, source_col), (target_row, target_col) in zip(source_anchors, target_anchors):
+        source_body_start, source_body_end, source_body_col, source_body_col_end = l2_note_body_bounds(
+            ws_prior_formula,
+            source_row,
+            source_col,
+        )
+        value = None
+        for row in range(source_body_start, source_body_end + 1):
+            for col in range(source_body_col, source_body_col_end + 1):
+                candidate = rollable_cell_value(
+                    ws_prior_formula.cell(row, col),
+                    ws_prior_values.cell(row, col),
+                )
+                if candidate not in (None, ""):
+                    value = candidate
+                    break
+            if value not in (None, ""):
+                break
+        if value in (None, ""):
+            continue
+
+        target_body_row, _, target_body_col, _ = l2_note_body_bounds(ws_new, target_row, target_col)
+        if set_cell_value(ws_new, target_body_row, target_body_col, value):
+            highlight_wording_cell(ws_new, target_body_row, target_body_col)
+            copied += 1
+    return copied
+
+
 def process_l2_wording_sections(wb_prior_formula, wb_prior_values, wb_new, warnings_list=None):
     """Roll L2 wording sections that need placement across changed templates."""
     sheet_name = "L2.00 Lead"
-    if sheet_name not in wb_prior_formula.sheetnames or sheet_name not in wb_new.sheetnames:
-        return 0
-
     copied = 0
-    copied += process_l2_lead_expectation_table(
-        wb_prior_formula[sheet_name],
-        wb_prior_values[sheet_name],
-        wb_new[sheet_name],
-    )
-    copied += process_l2_lead_notes(
-        wb_prior_formula[sheet_name],
-        wb_prior_values[sheet_name],
-        wb_new[sheet_name],
-    )
+    if (
+        sheet_name in wb_prior_formula.sheetnames
+        and sheet_name in wb_prior_values.sheetnames
+        and sheet_name in wb_new.sheetnames
+    ):
+        copied += process_l2_lead_expectation_table(
+            wb_prior_formula[sheet_name],
+            wb_prior_values[sheet_name],
+            wb_new[sheet_name],
+        )
+        copied += process_l2_lead_notes(
+            wb_prior_formula[sheet_name],
+            wb_prior_values[sheet_name],
+            wb_new[sheet_name],
+        )
+        copied += process_l2_lead_adjustment_summary(
+            wb_prior_formula[sheet_name],
+            wb_prior_values[sheet_name],
+            wb_new[sheet_name],
+        )
+
+    prior_bkd_name = next((name for name in wb_prior_formula.sheetnames if "L2.01.1" in name), None)
+    new_bkd_name = next((name for name in wb_new.sheetnames if "L2.01.1" in name), None)
+    if prior_bkd_name and new_bkd_name and prior_bkd_name in wb_prior_values.sheetnames:
+        copied += process_l2_bkd_notes(
+            wb_prior_formula[prior_bkd_name],
+            wb_prior_values[prior_bkd_name],
+            wb_new[new_bkd_name],
+        )
 
     if copied and warnings_list is not None:
         warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
@@ -2020,8 +2445,6 @@ def process_lead_sheet(ws_prior, ws_new, ws_prior_values, company_info, bs_date,
                 # C列填入Level（风险等级，如"Low", "Moderate", "High"）
                 ws_new.cell(row=row, column=3).value = company_info["Level"]
                 break
-    else:
-        warnings_list.append("PMTE信息表中未找到Level数据，请手动填写风险等级")
 
     if company_info.get("RP"):
         # 在CRA区域查找"实质性"等行，填入RP
@@ -2031,8 +2454,6 @@ def process_lead_sheet(ws_prior, ws_new, ws_prior_values, company_info, bs_date,
                 # D列填入RP（风险系数百分比）
                 ws_new.cell(row=row, column=4).value = company_info["RP"]
                 break
-    else:
-        warnings_list.append("PMTE信息表中未找到RP数据，请手动填写风险系数")
 
     # 新增：根据CRA等级表动态填写每个认定的等级和比例
     cra_data = company_info.get("cra_data", {})
@@ -2789,19 +3210,54 @@ def process_l1_from_rollforward_schedule(ws_schedule, ws_new_lead, ws_new_k01, s
     return copied
 
 
-def process_l2_bkd(ws_prior_values, ws_new):
-    """Roll L2.01.1 project-level prior year-end balances to current openings."""
-    def copy_business_row(source_row, target_row):
-        # Columns beyond R belong to hidden template plug-ins and must not be cloned.
-        for col in range(1, 19):
-            copy_cell_shape(
-                ws_new.cell(row=source_row, column=col),
-                ws_new.cell(row=target_row, column=col),
-                translate_formula=True,
-            )
-        if source_row in ws_new.row_dimensions:
-            ws_new.row_dimensions[target_row].height = ws_new.row_dimensions[source_row].height
+def find_l2_business_end_col(ws, header_row):
+    """Find the last real L2 BKD business column without touching trailing plug-in cells."""
+    last_col = 0
+    for col in range(1, min(ws.max_column, 60) + 1):
+        if any(
+            ws.cell(row=row, column=col).value not in (None, "")
+            for row in range(max(1, header_row - 2), header_row + 1)
+        ):
+            last_col = col
+    return last_col
 
+
+def extend_detail_data_validations(ws, data_start_row, old_detail_end, new_detail_end, business_end_col):
+    """Extend table data validations over every newly created business row."""
+    for validation in getattr(ws.data_validations, "dataValidation", []):
+        updated_ranges = []
+        for cell_range in validation.sqref.ranges:
+            updated = CellRange(str(cell_range))
+            if (
+                updated.min_col <= business_end_col
+                and updated.max_col >= 1
+                and updated.min_row <= old_detail_end
+                and updated.max_row >= data_start_row
+            ):
+                updated.min_row = min(updated.min_row, data_start_row)
+                updated.max_row = max(updated.max_row, new_detail_end)
+            updated_ranges.append(updated)
+        validation.sqref = MultiCellRange(updated_ranges)
+
+
+def shift_unqualified_formula_rows(formula, insert_row, amount):
+    """Shift same-sheet A1 row references while leaving sheet-qualified links unchanged."""
+    if not isinstance(formula, str) or not formula.startswith("=") or amount <= 0:
+        return formula
+
+    pattern = re.compile(r"(?<![A-Za-z0-9_!'\"])(?P<col>\$?[A-Z]{1,3})(?P<row_abs>\$?)(?P<row>\d+)")
+
+    def replace(match):
+        row = int(match.group("row"))
+        if row < insert_row:
+            return match.group(0)
+        return f"{match.group('col')}{match.group('row_abs')}{row + amount}"
+
+    return pattern.sub(replace, formula)
+
+
+def process_l2_bkd(ws_prior_values, ws_new):
+    """Roll L2.01.1 openings and extend every visible business section cleanly."""
     header_row = find_header_row(ws_prior_values, "项目编码", (1, 80))
     new_header_row = find_header_row(ws_new, "项目编码", (1, 80))
     if not header_row or not new_header_row:
@@ -2811,6 +3267,29 @@ def process_l2_bkd(ws_prior_values, ws_new):
     new_total_row = find_total_row_after(ws_new, new_header_row)
     if not prior_total_row or not new_total_row:
         return 0
+
+    business_end_col = find_l2_business_end_col(ws_new, new_header_row)
+    if business_end_col < 18:
+        return 0
+
+    original_total_row = new_total_row
+    old_detail_end = original_total_row - 1
+    total_formulas = {
+        col: ws_new.cell(original_total_row, col).value
+        for col in range(1, business_end_col + 1)
+        if isinstance(ws_new.cell(original_total_row, col).value, str)
+        and ws_new.cell(original_total_row, col).value.startswith("=")
+    }
+
+    def copy_business_row(source_row, target_row):
+        for col in range(1, business_end_col + 1):
+            copy_cell_shape(
+                ws_new.cell(row=source_row, column=col),
+                ws_new.cell(row=target_row, column=col),
+                translate_formula=True,
+            )
+        if source_row in ws_new.row_dimensions:
+            ws_new.row_dimensions[target_row].height = ws_new.row_dimensions[source_row].height
 
     records = []
     for row in range(header_row + 1, prior_total_row):
@@ -2858,6 +3337,16 @@ def process_l2_bkd(ws_prior_values, ws_new):
         for offset in range(extra_rows):
             copy_business_row(formula_source_row, new_total_row + offset)
         new_total_row += extra_rows
+        for row in range(new_total_row + 1, ws_new.max_row + 1):
+            for col in range(1, business_end_col + 1):
+                formula = ws_new.cell(row, col).value
+                updated_formula = shift_unqualified_formula_rows(
+                    formula,
+                    original_total_row,
+                    extra_rows,
+                )
+                if updated_formula != formula:
+                    set_cell_value(ws_new, row, col, updated_formula)
 
     copied = 0
     for idx, record in enumerate(records):
@@ -2898,9 +3387,27 @@ def process_l2_bkd(ws_prior_values, ws_new):
             set_cell_value(ws_new, row, 18, f"=O{row}+P{row}-Q{row}")
 
     last_sum_row = data_start_row + len(records) - 1
-    for col in (7, 8, 9, 12, 13, 14, 15, 16, 17, 18):
+    for col, formula in total_formulas.items():
         col_letter = get_column_letter(col)
-        set_cell_value(ws_new, new_total_row, col, f"=SUM({col_letter}{data_start_row}:{col_letter}{last_sum_row})")
+        if formula.upper().startswith("=SUM("):
+            updated_formula = f"=SUM({col_letter}{data_start_row}:{col_letter}{last_sum_row})"
+        else:
+            try:
+                updated_formula = Translator(
+                    formula,
+                    origin=f"{col_letter}{original_total_row}",
+                ).translate_formula(f"{col_letter}{new_total_row}")
+            except Exception:
+                updated_formula = formula
+        set_cell_value(ws_new, new_total_row, col, updated_formula)
+
+    extend_detail_data_validations(
+        ws_new,
+        data_start_row,
+        old_detail_end,
+        last_sum_row,
+        business_end_col,
+    )
 
     return copied
 
@@ -4818,6 +5325,15 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                         wb_new[new_k033_sheet]
                     )
 
+            if subject_code == "C":
+                prior_c_bkd_sheet = next((s for s in wb_prior_values.sheetnames if normalize_text(s) == "C.00BKD"), None)
+                new_c_bkd_sheet = next((s for s in wb_new.sheetnames if normalize_text(s) == "C.00BKD"), None)
+                if prior_c_bkd_sheet and new_c_bkd_sheet:
+                    process_c_bkd_basic_info(
+                        wb_prior_values[prior_c_bkd_sheet],
+                        wb_new[new_c_bkd_sheet],
+                    )
+
             if subject_code == "L2":
                 prior_l2_bkd_sheet = next((s for s in wb_prior_values.sheetnames if "L2.01.1" in s), None)
                 new_l2_bkd_sheet = next((s for s in wb_new.sheetnames if "L2.01.1" in s), None)
@@ -4971,6 +5487,19 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                 )
                 wording_copied_count += copied
                 wording_touched_sheets.update(touched_sheets)
+                if subject_code == "C":
+                    prior_cutoff_sheet = next((s for s in wb_prior_formula.sheetnames if normalize_text(s).upper().startswith("C.03CUTOFF")), None)
+                    new_cutoff_sheet = next((s for s in wb_new.sheetnames if normalize_text(s).upper().startswith("C.03CUTOFF")), None)
+                    if prior_cutoff_sheet and new_cutoff_sheet and prior_cutoff_sheet in wb_prior_values.sheetnames:
+                        copied = process_c_cutoff_wording(
+                            wb_prior_formula[prior_cutoff_sheet],
+                            wb_prior_values[prior_cutoff_sheet],
+                            wb_new[new_cutoff_sheet],
+                        )
+                        wording_copied_count += copied
+                        if copied:
+                            wording_touched_sheets.add(new_cutoff_sheet)
+                            warnings_list.append("已 roll forward wording，请项目组更新黄色标注区域")
                 if subject_code == "J1":
                     copied = process_j1_wording_sections(
                         wb_prior_formula,
@@ -4990,7 +5519,7 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
                     )
                     wording_copied_count += copied
                     if copied:
-                        wording_touched_sheets.update(["L2.00 Lead", "L2.02"])
+                        wording_touched_sheets.update(["L2.00 Lead", "L2.01.1 BKD"])
 
             # 8. 保存
             if cra_records:
