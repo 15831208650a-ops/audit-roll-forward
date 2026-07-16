@@ -23,6 +23,9 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import PatternFill
 
 
+CRA_PARSER_VERSION = "2026-07-crafix1"
+
+
 ASSERTION_ALIASES = {
     "C": ("C", "COMPLETENESS", "\u5b8c\u6574"),
     "E/O": ("E/O", "EO", "E", "O", "EXISTENCE", "OCCURRENCE", "\u5b58\u5728", "\u53d1\u751f"),
@@ -63,6 +66,28 @@ SUBJECT_ALIASES = {
         "ADMINISTRATIVE EXPENSE",
         "GENERAL AND ADMIN",
     ),
+}
+
+EXPLICIT_SUBJECT_CODES = {
+    "C": "C",
+    "F": "F",
+    "F1": "F1",
+    "E1": "E1",
+    "ECL": "ECL",
+    "G3": "G3",
+    "J1": "J1",
+    "K1": "K1",
+    "L1": "L1",
+    "L2": "L2",
+    "M": "M",
+    "N": "N",
+    "Q1": "Q1",
+    "UEXP": "Uexp",
+    "U_EXP": "Uexp",
+    "UEXPVCVD": "UexpVCVD",
+    "VC&VD": "UexpVCVD",
+    "VC": "UexpVCVD",
+    "VD": "UexpVCVD",
 }
 
 LIABILITY_EXPENSE_SUBJECTS = {"M", "N", "Q1", "Uexp", "UexpVCVD"}
@@ -293,6 +318,20 @@ def match_subject(account_name: Any) -> str:
     compact = re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "", key)
     if is_assertion_only_text(key):
         return ""
+
+    code_match = re.match(
+        r"^([A-Z][A-Z0-9_]*(?:&[A-Z0-9_]+)?)\s*(?=[.．、:：\-\s]|$)",
+        key,
+    )
+    if code_match:
+        explicit_code = code_match.group(1)
+        if explicit_code in EXPLICIT_SUBJECT_CODES:
+            return EXPLICIT_SUBJECT_CODES[explicit_code]
+
+    exact_code = re.sub(r"[^A-Z0-9_&]+", "", key)
+    if exact_code in EXPLICIT_SUBJECT_CODES:
+        return EXPLICIT_SUBJECT_CODES[exact_code]
+
     best_subject = ""
     best_length = 0
     for subject_code, aliases in SUBJECT_ALIASES.items():
@@ -301,7 +340,19 @@ def match_subject(account_name: Any) -> str:
             alias_compact = re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "", alias_key)
             if alias_compact == compact and alias_compact in ASSERTION_ONLY_KEYS:
                 continue
-            if alias_key and (alias_key in key or alias_compact in compact):
+            if not alias_key:
+                continue
+            code_like = bool(re.fullmatch(r"[A-Z0-9_&]+", alias_key))
+            if code_like and len(alias_compact) <= 3:
+                matched = bool(
+                    re.search(
+                        rf"(?<![A-Z0-9_]){re.escape(alias_key)}(?![A-Z0-9_])",
+                        key,
+                    )
+                )
+            else:
+                matched = alias_key in key or alias_compact in compact
+            if matched:
                 score = max(len(alias_key), len(alias_compact))
                 if score > best_length:
                     best_subject = subject_code
@@ -635,6 +686,46 @@ def find_ratio_cell(row: list[str]) -> tuple[int | None, str]:
     return None, ""
 
 
+def infer_applicable_cell(row: list[str], ratio_index: int | None = None) -> str:
+    """Find a Y/N-style applicability marker when the exported header is blank."""
+    search_end = ratio_index if ratio_index is not None else len(row)
+    for index in range(search_end - 1, -1, -1):
+        value = str(row[index] or "").strip()
+        key = normalize_key(value)
+        compact = re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "", key)
+        if key in {"Y", "YES", "N", "NO", "是", "否", "适用", "不适用", "不適用"}:
+            return value
+        if key in {"N/A", "NA"} and index + 1 < len(row):
+            next_value = row[index + 1]
+            if is_percent_like(next_value) or normalize_key(next_value) in {"N/A", "NA"}:
+                return value
+        if compact in {"YES", "NO", "是", "否", "适用", "不适用", "不適用"}:
+            return value
+    return ""
+
+
+def detect_section_account(row: list[str]) -> str:
+    """Recognize a standalone CRA account heading before its assertion rows."""
+    populated = [str(cell or "").strip() for cell in row if str(cell or "").strip()]
+    if not populated:
+        return ""
+    if any(normalize_risk_level(cell) or is_percent_like(cell) for cell in populated):
+        return ""
+    if any(is_account_assertion_cell(cell) for cell in populated):
+        return ""
+
+    for index, cell in enumerate(populated):
+        subject_code = match_subject(cell)
+        if not subject_code:
+            continue
+        if cell.upper() in EXPLICIT_SUBJECT_CODES and index + 1 < len(populated):
+            next_cell = populated[index + 1]
+            if match_subject(next_cell) == subject_code:
+                return clean_account_name(next_cell)
+        return clean_account_name(cell)
+    return ""
+
+
 def find_cra_cell(row: list[str], ratio_index: int | None) -> tuple[int | None, str, str]:
     search_end = ratio_index if ratio_index is not None else len(row)
     for index in range(search_end - 1, -1, -1):
@@ -790,6 +881,11 @@ def parse_cra_paste_text(
     current_account = ""
 
     for row_index, row in enumerate(data_rows):
+        section_account = detect_section_account(row)
+        if section_account:
+            current_account = section_account
+            continue
+
         account_raw = ""
         assertion_raw = ""
         cra_raw = ""
@@ -808,6 +904,8 @@ def parse_cra_paste_text(
             account_raw_assertion = normalize_assertion(account_raw)
             if cleaned_account and not is_assertion_only_text(cleaned_account):
                 account = cleaned_account
+            elif guessed_account and not is_assertion_only_text(guessed_account):
+                account = clean_account_name(guessed_account)
             elif current_account:
                 account = current_account
             else:
@@ -820,6 +918,9 @@ def parse_cra_paste_text(
                 ratio_raw = guessed_ratio
             elif not ratio_raw:
                 ratio_raw = guessed_ratio
+            if not applicable_raw:
+                guessed_ratio_index, _ = find_ratio_cell(row)
+                applicable_raw = infer_applicable_cell(row, guessed_ratio_index)
             if "+SC" in normalize_key(cra_raw):
                 note = f"CRA原值 {cra_raw} 已标准化为 {cra_level}"
             if not note:

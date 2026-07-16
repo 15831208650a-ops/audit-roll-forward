@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
 
 from roll_forward_core import SubjectConfig, process_multiple_subjects, resource_path
 from cra_support import (
+    CRA_PARSER_VERSION,
     detect_cra_header_options,
     parse_cra_paste_text,
     write_cra_parse_debug_log,
@@ -83,6 +84,17 @@ FEEDBACK_STATE_PATH = APP_STATE_DIR / "feedback_state.json"
 GUIDE_STATE_PATH = APP_STATE_DIR / "guide_state.json"
 APP_LOG_PATH = APP_STATE_DIR / "logs" / "app.log"
 WORKBENCH_PROJECTS_PATH = APP_STATE_DIR / "projects.json"
+
+
+class SortableTableWidgetItem(QTableWidgetItem):
+    """Sort percentages numerically while retaining their formatted display text."""
+
+    def __lt__(self, other):
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole) if isinstance(other, QTableWidgetItem) else None
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left < right
+        return super().__lt__(other)
 
 FILE_DIALOG_STYLESHEET = """
     QFileDialog {
@@ -708,6 +720,8 @@ class RollForwardApp(QWidget):
             "cra_canvas_token": "",
             "cra_text": "",
             "cra_table_records": [],
+            "cra_records_stale": False,
+            "cra_parser_version": "",
             "apply_cra": False,
             "status": "未处理",
             "generated": 0,
@@ -1207,6 +1221,7 @@ class RollForwardApp(QWidget):
         self.apply_cra_checkbox.setToolTip("开启后，仅匹配状态为“将写入”的 CRA 记录会写入输出底稿；预览表不需要逐行勾选。")
 
         self.apply_cra_checkbox.stateChanged.connect(lambda *_: self.update_execution_cra_status())
+        self.cra_records_stale = False
 
         hint = QLabel(
             "从 CRA Excel 或 Canvas 导出/复制区域粘贴到左侧。解析后右侧会按当前已选择的底稿科目自动判断是否写入。"
@@ -1292,6 +1307,29 @@ class RollForwardApp(QWidget):
 
         right_panel = QGroupBox("解析信息")
         right_layout = QVBoxLayout(right_panel)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        self.cra_filter_input = QLineEdit()
+        self.cra_filter_input.setPlaceholderText("搜索科目、认定或备注")
+        self.cra_filter_input.setClearButtonEnabled(True)
+        self.cra_filter_input.textChanged.connect(self.apply_cra_table_filters)
+        self.cra_subject_filter = QComboBox()
+        self.cra_subject_filter.addItem("全部底稿科目", "__all__")
+        self.cra_subject_filter.currentIndexChanged.connect(self.apply_cra_table_filters)
+        self.cra_status_filter = QComboBox()
+        self.cra_status_filter.addItem("全部状态", "__all__")
+        self.cra_status_filter.addItem("将写入", "write")
+        self.cra_status_filter.addItem("需确认", "confirm")
+        self.cra_status_filter.addItem("不写入", "skip")
+        self.cra_status_filter.currentIndexChanged.connect(self.apply_cra_table_filters)
+        self.cra_exception_filter = QCheckBox("只看异常")
+        self.cra_exception_filter.stateChanged.connect(self.apply_cra_table_filters)
+        filter_row.addWidget(self.cra_filter_input, 2)
+        filter_row.addWidget(self.cra_subject_filter, 1)
+        filter_row.addWidget(self.cra_status_filter, 1)
+        filter_row.addWidget(self.cra_exception_filter)
+        right_layout.addLayout(filter_row)
+
         self.cra_table = QTableWidget(0, 9)
         self.cra_table.setHorizontalHeaderLabels([
             "匹配状态",
@@ -1310,6 +1348,8 @@ class RollForwardApp(QWidget):
             | QTableWidget.EditTrigger.SelectedClicked
         )
         self.cra_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.cra_table.setSortingEnabled(True)
+        self.cra_table.horizontalHeader().setSortIndicatorShown(True)
         self.cra_table.verticalHeader().setVisible(False)
         self.cra_table.setMinimumHeight(430)
         self.cra_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -1761,6 +1801,12 @@ class RollForwardApp(QWidget):
             "cra_canvas_token": self.cra_canvas_token_input.text().strip() if hasattr(self, "cra_canvas_token_input") else "",
             "cra_text": self.cra_text_input.toPlainText(),
             "cra_table_records": self.collect_cra_table_records(include_all=True) if hasattr(self, "cra_table") else company.get("cra_table_records", []),
+            "cra_records_stale": bool(getattr(self, "cra_records_stale", False)),
+            "cra_parser_version": (
+                CRA_PARSER_VERSION
+                if not getattr(self, "cra_records_stale", False) and hasattr(self, "cra_table") and self.cra_table.rowCount()
+                else company.get("cra_parser_version", "")
+            ),
             "apply_cra": self.apply_cra_checkbox.isChecked(),
         })
         if hasattr(self, "project_name_input") and getattr(self, "project_view_mode", "detail") != "list":
@@ -1798,17 +1844,27 @@ class RollForwardApp(QWidget):
         self.cra_text_input.blockSignals(True)
         self.cra_text_input.setPlainText(company.get("cra_text", ""))
         self.cra_text_input.blockSignals(False)
-        self.apply_cra_checkbox.setChecked(bool(company.get("apply_cra", False)))
-        self.cra_table.setRowCount(0)
         saved_cra_records = company.get("cra_table_records") or []
+        parser_version_stale = bool(
+            saved_cra_records
+            and company.get("cra_parser_version", "") != CRA_PARSER_VERSION
+        )
+        self.cra_records_stale = bool(company.get("cra_records_stale", False)) or parser_version_stale
+        self.apply_cra_checkbox.setEnabled(not self.cra_records_stale)
+        self.apply_cra_checkbox.setChecked(bool(company.get("apply_cra", False)) and not self.cra_records_stale)
+        self.cra_table.setRowCount(0)
         if saved_cra_records:
             self.populate_cra_table(saved_cra_records)
             write_count = sum(1 for record in saved_cra_records if record.get("match_status") == "将写入")
-            self.cra_status_label.setText(f"已保留 {len(saved_cra_records)} 条 CRA 解析记录，{write_count} 条将写入")
-            self.cra_status_label.setStyleSheet(f"color: {EY_SUCCESS};")
+            if self.cra_records_stale:
+                self.cra_status_label.setText("内容已变化，请重新解析；右侧旧结果仅供对照")
+                self.cra_status_label.setStyleSheet(f"color: {EY_YELLOW};")
+            else:
+                self.cra_status_label.setText(f"已保留 {len(saved_cra_records)} 条 CRA 解析记录，{write_count} 条将写入")
+                self.cra_status_label.setStyleSheet(f"color: {EY_SUCCESS};")
         else:
-            self.cra_status_label.setText("未解析")
-            self.cra_status_label.setStyleSheet(f"color: {EY_MUTED};")
+            self.cra_status_label.setText("内容已变化，请重新解析" if self.cra_records_stale else "未解析")
+            self.cra_status_label.setStyleSheet(f"color: {EY_YELLOW if self.cra_records_stale else EY_MUTED};")
         self.update_execution_cra_status()
         self.refresh_project_table(select_index=self.current_company_index)
 
@@ -1974,10 +2030,32 @@ class RollForwardApp(QWidget):
     def cra_input_changed(self):
         if hasattr(self, "cra_skip_confirmed_companies"):
             self.cra_skip_confirmed_companies.discard(self.current_company_key())
+        has_text = bool(self.cra_text_input.toPlainText().strip()) if hasattr(self, "cra_text_input") else False
+        has_preview = bool(self.cra_table.rowCount()) if hasattr(self, "cra_table") else False
+        self.cra_records_stale = has_text or has_preview
+        if hasattr(self, "apply_cra_checkbox"):
+            self.apply_cra_checkbox.setChecked(False)
+            self.apply_cra_checkbox.setEnabled(not self.cra_records_stale)
+        if hasattr(self, "cra_status_label"):
+            if self.cra_records_stale:
+                suffix = "；右侧旧结果仅供对照" if has_preview else ""
+                self.cra_status_label.setText(f"内容已变化，请重新解析{suffix}")
+                self.cra_status_label.setStyleSheet(f"color: {EY_YELLOW};")
+            else:
+                self.cra_status_label.setText("未解析")
+                self.cra_status_label.setStyleSheet(f"color: {EY_MUTED};")
         if hasattr(self, "execution_cra_status_label"):
             self.update_execution_cra_status()
 
     def cra_records_for_company(self, company, subject_codes=None):
+        if company is self.current_company() and getattr(self, "cra_records_stale", False):
+            return []
+        if company is not self.current_company():
+            stored_records = company.get("cra_table_records") or []
+            if company.get("cra_records_stale", False) or (
+                stored_records and company.get("cra_parser_version", "") != CRA_PARSER_VERSION
+            ):
+                return []
         if hasattr(self, "cra_table") and company is self.current_company():
             return self.collect_cra_table_records(include_all=True)
         table_records = company.get("cra_table_records") or []
@@ -2005,6 +2083,15 @@ class RollForwardApp(QWidget):
             company = companies[max(0, min(company_index, len(companies) - 1))]
         subject_codes = list(company.get("subjects", []))
         text = str(company.get("cra_text", "")).strip()
+        is_current_company = company_index is None or company_index == self.current_company_index
+        records_stale = (
+            bool(getattr(self, "cra_records_stale", False))
+            if is_current_company
+            else bool(company.get("cra_records_stale", False)) or bool(
+                company.get("cra_table_records")
+                and company.get("cra_parser_version", "") != CRA_PARSER_VERSION
+            )
+        )
         if company_index is None or company_index == self.current_company_index:
             if hasattr(self, "cra_text_input"):
                 text = self.cra_text_input.toPlainText().strip()
@@ -2013,8 +2100,11 @@ class RollForwardApp(QWidget):
                 records = company.get("cra_table_records") or []
         else:
             records = company.get("cra_table_records") or []
+        if records_stale:
+            records = []
         if not records and text:
-            records = self.cra_records_for_company({**company, "cra_text": text}, subject_codes)
+            if not records_stale:
+                records = self.cra_records_for_company({**company, "cra_text": text}, subject_codes)
         write_records = [record for record in records if record.get("match_status") == "将写入"]
         selected = set(subject_codes)
         matched = {record.get("subject_code") for record in write_records if record.get("subject_code")}
@@ -2023,7 +2113,9 @@ class RollForwardApp(QWidget):
         if company_index is None or company_index == self.current_company_index:
             apply_enabled = self.apply_cra_checkbox.isChecked() if hasattr(self, "apply_cra_checkbox") else apply_enabled
         skip_confirmed = self.current_company_key(company_index) in getattr(self, "cra_skip_confirmed_companies", set())
-        if skip_confirmed:
+        if records_stale:
+            status = "CRA：内容已变化，请重新解析"
+        elif skip_confirmed:
             status = "CRA：本次明确不使用"
         elif not text and not records:
             status = "CRA：未解析"
@@ -2041,6 +2133,7 @@ class RollForwardApp(QWidget):
             "apply_enabled": apply_enabled,
             "text": text,
             "skip_confirmed": skip_confirmed,
+            "records_stale": records_stale,
         }
 
     def update_execution_cra_status(self):
@@ -2176,13 +2269,20 @@ class RollForwardApp(QWidget):
         records = parse_cra_paste_text(text, self.selected_subject_codes(), cra_column)
         self.populate_cra_table(records)
         if records:
+            self.cra_records_stale = False
+            self.apply_cra_checkbox.setEnabled(True)
             write_count = sum(1 for record in records if record.get("match_status") == "将写入")
             ratio_count = sum(1 for record in records if record.get("ratio_text"))
             self.cra_status_label.setText(f"已解析 {len(records)} 条，{write_count} 条将写入，{ratio_count} 条有比例")
             self.cra_status_label.setStyleSheet(f"color: {EY_SUCCESS};")
             self.apply_cra_checkbox.setChecked(True)
+            self.save_current_company_from_form()
+            self.save_workbench_data()
             self.update_execution_cra_status()
         else:
+            self.cra_records_stale = True
+            self.apply_cra_checkbox.setChecked(False)
+            self.apply_cra_checkbox.setEnabled(False)
             self.cra_status_label.setText("未解析到有效 CRA 记录")
             self.cra_status_label.setStyleSheet(f"color: {EY_ERROR};")
             self.update_execution_cra_status()
@@ -2193,6 +2293,8 @@ class RollForwardApp(QWidget):
             )
 
     def populate_cra_table(self, records):
+        sorting_enabled = self.cra_table.isSortingEnabled()
+        self.cra_table.setSortingEnabled(False)
         self._updating_cra_table = True
         self.cra_table.setRowCount(len(records))
         try:
@@ -2200,6 +2302,9 @@ class RollForwardApp(QWidget):
                 self.set_cra_table_row(row, record)
         finally:
             self._updating_cra_table = False
+            self.cra_table.setSortingEnabled(sorting_enabled)
+        self.refresh_cra_filter_options()
+        self.apply_cra_table_filters()
         self.cra_table.resizeRowsToContents()
 
     def set_cra_table_row(self, row, record):
@@ -2217,7 +2322,17 @@ class RollForwardApp(QWidget):
             record.get("note", ""),
         ]
         for col, value in enumerate(values):
-            item = QTableWidgetItem(str(value or ""))
+            item = SortableTableWidgetItem(str(value or "")) if col == 5 else QTableWidgetItem(str(value or ""))
+            if col == 5:
+                sort_value = ratio
+                try:
+                    sort_value = float(sort_value)
+                except (TypeError, ValueError):
+                    sort_value = self.parse_cra_ratio_value(ratio_text)
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    sort_value if sort_value not in (None, "") else -1.0,
+                )
             if col in (6, 7):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if col == 0 and str(value) == "将写入":
@@ -2231,6 +2346,59 @@ class RollForwardApp(QWidget):
             elif col == 7 and str(value) == "通过":
                 item.setForeground(QColor(EY_SUCCESS))
             self.cra_table.setItem(row, col, item)
+
+    def refresh_cra_filter_options(self):
+        if not hasattr(self, "cra_subject_filter"):
+            return
+        current_data = self.cra_subject_filter.currentData()
+        subjects = sorted({
+            self.cra_table_text(row, 1)
+            for row in range(self.cra_table.rowCount())
+        })
+        self.cra_subject_filter.blockSignals(True)
+        self.cra_subject_filter.clear()
+        self.cra_subject_filter.addItem("全部底稿科目", "__all__")
+        for subject in subjects:
+            self.cra_subject_filter.addItem(subject or "未匹配科目", subject)
+        index = self.cra_subject_filter.findData(current_data)
+        self.cra_subject_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.cra_subject_filter.blockSignals(False)
+
+    def apply_cra_table_filters(self, *_args):
+        if not hasattr(self, "cra_table"):
+            return
+        search_text = self.cra_filter_input.text().strip().lower() if hasattr(self, "cra_filter_input") else ""
+        subject_filter = self.cra_subject_filter.currentData() if hasattr(self, "cra_subject_filter") else "__all__"
+        status_filter = self.cra_status_filter.currentData() if hasattr(self, "cra_status_filter") else "__all__"
+        exception_only = self.cra_exception_filter.isChecked() if hasattr(self, "cra_exception_filter") else False
+
+        for row in range(self.cra_table.rowCount()):
+            status = self.cra_table_text(row, 0)
+            subject = self.cra_table_text(row, 1)
+            searchable = " ".join(
+                self.cra_table_text(row, col).lower()
+                for col in (1, 2, 3, 4, 8)
+            )
+            visible = not search_text or search_text in searchable
+            if subject_filter != "__all__":
+                visible = visible and subject == str(subject_filter or "")
+            if status_filter == "write":
+                visible = visible and status == "将写入"
+            elif status_filter == "confirm":
+                visible = visible and status.startswith("需确认")
+            elif status_filter == "skip":
+                visible = visible and status.startswith("不写入")
+            if exception_only:
+                ratio_status = self.cra_table_text(row, 6)
+                range_status = self.cra_table_text(row, 7)
+                is_exception = (
+                    status != "将写入"
+                    or range_status.startswith("超出")
+                    or "未识别" in ratio_status
+                    or "区间" in ratio_status
+                )
+                visible = visible and is_exception
+            self.cra_table.setRowHidden(row, not visible)
 
     def cra_table_text(self, row, col):
         item = self.cra_table.item(row, col)
@@ -2291,6 +2459,8 @@ class RollForwardApp(QWidget):
             return
         if item.column() in (6, 7):
             return
+        sorting_enabled = self.cra_table.isSortingEnabled()
+        self.cra_table.setSortingEnabled(False)
         self._updating_cra_table = True
         try:
             record = self.cra_table_record_from_row(item.row())
@@ -2298,6 +2468,12 @@ class RollForwardApp(QWidget):
                 table_item = self.cra_table.item(item.row(), col)
                 if table_item:
                     table_item.setText(str(value or ""))
+                    if col == 5:
+                        sort_value = record.get("ratio")
+                        table_item.setData(
+                            Qt.ItemDataRole.UserRole,
+                            float(sort_value) if sort_value not in (None, "") else -1.0,
+                        )
             status_item = self.cra_table.item(item.row(), 0)
             if status_item:
                 status_item.setForeground(QColor(EY_SUCCESS if record.get("match_status") == "将写入" else EY_MUTED))
@@ -2310,6 +2486,9 @@ class RollForwardApp(QWidget):
                     range_item.setForeground(QColor(EY_SUCCESS))
         finally:
             self._updating_cra_table = False
+            self.cra_table.setSortingEnabled(sorting_enabled)
+        self.refresh_cra_filter_options()
+        self.apply_cra_table_filters()
         rows = self.collect_cra_table_records(include_all=True)
         write_count = sum(1 for record in rows if record.get("match_status") == "将写入")
         self.cra_status_label.setText(f"已手工调整 {len(rows)} 条 CRA 记录，{write_count} 条将写入")
@@ -2317,7 +2496,11 @@ class RollForwardApp(QWidget):
         self.update_execution_cra_status()
 
     def collect_cra_records(self):
-        if not hasattr(self, "cra_table") or not self.apply_cra_checkbox.isChecked():
+        if (
+            not hasattr(self, "cra_table")
+            or not self.apply_cra_checkbox.isChecked()
+            or getattr(self, "cra_records_stale", False)
+        ):
             return []
 
         records = []
@@ -2359,12 +2542,21 @@ class RollForwardApp(QWidget):
         return records
 
     def clear_cra_inputs(self):
+        self.cra_text_input.blockSignals(True)
         self.cra_text_input.clear()
+        self.cra_text_input.blockSignals(False)
         self.cra_table.setRowCount(0)
+        self.cra_records_stale = False
         self.cra_column_combo.clear()
         self.cra_column_combo.addItem("粘贴后自动识别")
         self.cra_column_combo.setEnabled(False)
         self.apply_cra_checkbox.setChecked(False)
+        self.apply_cra_checkbox.setEnabled(True)
+        if hasattr(self, "cra_filter_input"):
+            self.cra_filter_input.clear()
+            self.cra_status_filter.setCurrentIndex(0)
+            self.cra_exception_filter.setChecked(False)
+            self.refresh_cra_filter_options()
         self.cra_status_label.setText("未解析")
         self.cra_status_label.setStyleSheet(f"color: {EY_MUTED};")
         self.cra_skip_confirmed_companies.discard(self.current_company_key())
