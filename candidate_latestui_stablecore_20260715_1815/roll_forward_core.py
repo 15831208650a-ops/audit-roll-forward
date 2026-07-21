@@ -4389,6 +4389,204 @@ def get_q1_covenant_image_row_shifts(ws_prior, ws_new):
     return shifts
 
 
+def restore_template_drawing_parts(template_path, output_path):
+    """Restore template drawings that openpyxl cannot round-trip safely."""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    content_type_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    drawing_rel_type = f"{office_rel_ns}/drawing"
+
+    def resolve_part(source_part, target):
+        if target.startswith("/"):
+            return target.lstrip("/")
+        return posixpath.normpath(
+            posixpath.join(posixpath.dirname(source_part), target)
+        )
+
+    def rels_part(source_part):
+        return posixpath.join(
+            posixpath.dirname(source_part),
+            "_rels",
+            posixpath.basename(source_part) + ".rels",
+        )
+
+    def sheet_parts(parts):
+        workbook = ElementTree.fromstring(parts["xl/workbook.xml"])
+        workbook_rels = ElementTree.fromstring(parts["xl/_rels/workbook.xml.rels"])
+        targets = {rel.attrib["Id"]: rel.attrib["Target"] for rel in workbook_rels}
+        result = {}
+        for sheet in workbook.findall(f"{{{main_ns}}}sheets/{{{main_ns}}}sheet"):
+            rel_id = sheet.attrib.get(f"{{{office_rel_ns}}}id")
+            if rel_id in targets:
+                result[sheet.attrib["name"]] = resolve_part(
+                    "xl/workbook.xml", targets[rel_id]
+                )
+        return result
+
+    with zipfile.ZipFile(template_path, "r") as template_zip:
+        source_parts = {
+            name: template_zip.read(name) for name in template_zip.namelist()
+        }
+        template_parts = {
+            name: data
+            for name, data in source_parts.items()
+            if name.startswith(("xl/drawings/", "xl/media/"))
+        }
+        template_content_types = source_parts["[Content_Types].xml"]
+
+    if not template_parts:
+        return 0
+
+    with zipfile.ZipFile(output_path, "r") as output_zip:
+        output_parts = {
+            name: output_zip.read(name) for name in output_zip.namelist()
+        }
+
+    output_parts.update(template_parts)
+
+    source_sheets = sheet_parts(source_parts)
+    output_sheets = sheet_parts(output_parts)
+    ElementTree.register_namespace("", main_ns)
+    ElementTree.register_namespace("r", office_rel_ns)
+    ElementTree.register_namespace("", package_rel_ns)
+
+    for sheet_name, source_sheet_part in source_sheets.items():
+        output_sheet_part = output_sheets.get(sheet_name)
+        source_sheet_rels_part = rels_part(source_sheet_part)
+        if not output_sheet_part or source_sheet_rels_part not in source_parts:
+            continue
+
+        source_sheet_rels = ElementTree.fromstring(
+            source_parts[source_sheet_rels_part]
+        )
+        source_drawing_rel = next(
+            (
+                rel
+                for rel in source_sheet_rels
+                if rel.attrib.get("Type") == drawing_rel_type
+            ),
+            None,
+        )
+        if source_drawing_rel is None:
+            continue
+
+        drawing_part = resolve_part(
+            source_sheet_part, source_drawing_rel.attrib["Target"]
+        )
+        output_sheet_rels_part = rels_part(output_sheet_part)
+        output_sheet_rels = (
+            ElementTree.fromstring(output_parts[output_sheet_rels_part])
+            if output_sheet_rels_part in output_parts
+            else ElementTree.Element(f"{{{package_rel_ns}}}Relationships")
+        )
+        output_drawing_rel = next(
+            (
+                rel
+                for rel in output_sheet_rels
+                if rel.attrib.get("Type") == drawing_rel_type
+            ),
+            None,
+        )
+        if output_drawing_rel is None:
+            existing_ids = {
+                rel.attrib.get("Id", "") for rel in output_sheet_rels
+            }
+            rel_number = 1
+            while f"rId{rel_number}" in existing_ids:
+                rel_number += 1
+            output_drawing_rel = ElementTree.SubElement(
+                output_sheet_rels,
+                f"{{{package_rel_ns}}}Relationship",
+                {
+                    "Id": f"rId{rel_number}",
+                    "Type": drawing_rel_type,
+                    "Target": posixpath.relpath(
+                        drawing_part, posixpath.dirname(output_sheet_part)
+                    ),
+                },
+            )
+        else:
+            output_drawing_rel.attrib["Target"] = posixpath.relpath(
+                drawing_part, posixpath.dirname(output_sheet_part)
+            )
+
+        output_sheet = ElementTree.fromstring(output_parts[output_sheet_part])
+        drawing_nodes = output_sheet.findall(f"{{{main_ns}}}drawing")
+        if drawing_nodes:
+            drawing_node = drawing_nodes[0]
+            for duplicate in drawing_nodes[1:]:
+                output_sheet.remove(duplicate)
+        else:
+            drawing_node = ElementTree.Element(f"{{{main_ns}}}drawing")
+            trailing_tags = {
+                "legacyDrawing", "legacyDrawingHF", "picture", "oleObjects",
+                "controls", "webPublishItems", "tableParts", "extLst",
+            }
+            insert_at = len(output_sheet)
+            for index, child in enumerate(list(output_sheet)):
+                if child.tag.rsplit("}", 1)[-1] in trailing_tags:
+                    insert_at = index
+                    break
+            output_sheet.insert(insert_at, drawing_node)
+        drawing_node.attrib[f"{{{office_rel_ns}}}id"] = output_drawing_rel.attrib["Id"]
+
+        output_parts[output_sheet_part] = ElementTree.tostring(
+            output_sheet, encoding="utf-8", xml_declaration=True
+        )
+        output_parts[output_sheet_rels_part] = ElementTree.tostring(
+            output_sheet_rels, encoding="utf-8", xml_declaration=True
+        )
+
+    content_types = ElementTree.fromstring(output_parts["[Content_Types].xml"])
+    source_content_types = ElementTree.fromstring(template_content_types)
+    existing_defaults = {
+        node.attrib.get("Extension", "").lower()
+        for node in content_types
+        if node.tag == f"{{{content_type_ns}}}Default"
+    }
+    existing_overrides = {
+        node.attrib.get("PartName", "")
+        for node in content_types
+        if node.tag == f"{{{content_type_ns}}}Override"
+    }
+    copied_extensions = {
+        posixpath.splitext(name)[1].lstrip(".").lower()
+        for name in template_parts
+        if posixpath.splitext(name)[1]
+    }
+    copied_part_names = {"/" + name for name in template_parts}
+
+    for node in source_content_types:
+        if node.tag == f"{{{content_type_ns}}}Default":
+            extension = node.attrib.get("Extension", "").lower()
+            if extension in copied_extensions and extension not in existing_defaults:
+                content_types.append(deepcopy(node))
+                existing_defaults.add(extension)
+        elif node.tag == f"{{{content_type_ns}}}Override":
+            part_name = node.attrib.get("PartName", "")
+            if part_name in copied_part_names and part_name not in existing_overrides:
+                content_types.append(deepcopy(node))
+                existing_overrides.add(part_name)
+
+    ElementTree.register_namespace("", content_type_ns)
+    output_parts["[Content_Types].xml"] = ElementTree.tostring(
+        content_types, encoding="utf-8", xml_declaration=True
+    )
+
+    temp_path = str(output_path) + ".drawing-restore.tmp"
+    try:
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, data in output_parts.items():
+                archive.writestr(name, data)
+        os.replace(temp_path, output_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    return len(template_parts)
+
+
 def copy_q1_review_images(prior_path, output_path, q105_row_shifts=None):
     """Copy only Q1 Note-area and covenant evidence images at package level."""
     main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -5563,6 +5761,7 @@ def process_single_subject(subject_code, template_path, prior_path, pmte_path,
             if progress_callback:
                 progress_callback(f"正在保存输出文件: {os.path.basename(output_path)}")
             wb_new.save(output_path)
+            restore_template_drawing_parts(template_path, output_path)
 
             if subject_code == "Q1":
                 try:

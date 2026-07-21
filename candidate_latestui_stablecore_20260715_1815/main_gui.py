@@ -98,6 +98,23 @@ class SortableTableWidgetItem(QTableWidgetItem):
             return left < right
         return super().__lt__(other)
 
+
+class CurrentPageStackedWidget(QStackedWidget):
+    """Size the main stack from its visible page instead of its tallest page."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def sizeHint(self):
+        current = self.currentWidget()
+        return current.sizeHint() if current is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        current = self.currentWidget()
+        return current.minimumSizeHint() if current is not None else super().minimumSizeHint()
+
+
 FILE_DIALOG_STYLESHEET = """
     QFileDialog {
         background: #F8FAFC;
@@ -814,7 +831,7 @@ class RollForwardApp(QWidget):
         self.company_workspace = self.create_company_workspace()
         self.footer_widget = self.create_footer()
         self.pages = {}
-        self.page_stack = QStackedWidget()
+        self.page_stack = CurrentPageStackedWidget()
         self.page_stack.setObjectName("PageStack")
 
         page_map = {
@@ -1534,9 +1551,17 @@ class RollForwardApp(QWidget):
         left.setStyleSheet(f"color: {EY_MUTED}; font-size: 11px;")
         right = QLabel("EY black / yellow theme")
         right.setStyleSheet(f"color: {EY_MUTED}; font-size: 11px;")
+        self.feedback_link = QLabel(
+            f'<a href="{FEEDBACK_URL}" style="color: {EY_YELLOW}; text-decoration: none;">意见反馈</a>'
+        )
+        self.feedback_link.setObjectName("FeedbackLink")
+        self.feedback_link.setOpenExternalLinks(True)
+        self.feedback_link.setToolTip("打开使用反馈问卷")
         layout.addWidget(left)
         layout.addStretch()
         layout.addWidget(right)
+        layout.addSpacing(12)
+        layout.addWidget(self.feedback_link)
         return footer
 
     def create_label(self, text):
